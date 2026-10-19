@@ -1,0 +1,78 @@
+name: Release
+
+# Builds Linux (AppImage), Windows (MSI), macOS (.app/.dmg), and Android
+# (debug APK) on every push of a version tag, then attaches all four
+# artifacts to a GitHub Release. iOS is intentionally excluded: it needs a
+# paid Apple Developer account and signing certificates as repo secrets,
+# which aren't set up.
+#
+# All four builds are ad-hoc/unsigned (--adhoc-sign, or debug-apk for
+# Android, which isn't signable at all). That's fine to install and run,
+# but macOS/Windows will show an "unidentified developer" warning, and the
+# Android APK can't go to the Play Store as-is. Real signing is future work.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            format: appimage
+            package-args: --adhoc-sign
+          - os: windows-latest
+            platform: windows
+            format: app
+            package-args: --adhoc-sign
+          - os: macos-latest
+            platform: macOS
+            format: app
+            package-args: --adhoc-sign
+          - os: ubuntu-latest
+            platform: android
+            format: gradle
+            package-args: -p debug-apk
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Briefcase
+        run: python -m pip install briefcase
+
+      - name: Build
+        run: briefcase build ${{ matrix.platform }} ${{ matrix.format }} --no-input
+
+      - name: Package
+        run: briefcase package ${{ matrix.platform }} ${{ matrix.format }} --no-input ${{ matrix.package-args }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}-${{ matrix.format }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          draft: true
+          generate_release_notes: true
