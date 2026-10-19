@@ -11,6 +11,12 @@ author_email = "agjennings@gmail.com"
 [tool.briefcase.app.peptide_dosage]
 formal_name = "Peptide Dosage"
 description = "Peptide reconstitution dosing, titration schedules, and adherence tracking."
+long_description = """
+Peptide Dosage is a cross-platform GUI for calculating peptide
+reconstitution dilutions, U-100 insulin syringe draws, titration
+schedules, multi-person patient protocol tracking, and PubMed literature
+citations. Research/educational tool -- not medical advice.
+"""
 sources = ["src/peptide_dosage"]
 requires = []
 
