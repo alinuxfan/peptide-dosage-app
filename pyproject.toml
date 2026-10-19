@@ -23,6 +23,19 @@ requires = ["toga-winforms~=0.5.0"]
 [tool.briefcase.app.peptide_dosage.linux]
 requires = ["toga-gtk~=0.5.0"]
 
+[tool.briefcase.app.peptide_dosage.linux.system]
+# Ubuntu 24.04+ ships GObject-Introspection 2.0 (libgirepository-2.0-dev);
+# older releases (22.04 and earlier) need libgirepository1.0-dev instead --
+# our CI only targets ubuntu:noble (24.04) so this list isn't distro-generic.
+system_requires = [
+    "pkg-config",
+    "python3-dev",
+    "libgirepository-2.0-dev",
+    "libcairo2-dev",
+    "gir1.2-gtk-3.0",
+    "libcanberra-gtk3-module",
+]
+
 [tool.briefcase.app.peptide_dosage.iOS]
 requires = ["toga-iOS~=0.5.0"]
 
