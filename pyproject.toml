@@ -12,7 +12,7 @@ author_email = "agjennings@gmail.com"
 formal_name = "Peptide Dosage"
 description = "Peptide reconstitution dosing, titration schedules, and adherence tracking."
 sources = ["src/peptide_dosage"]
-requires = ["toga~=0.5.0"]
+requires = []
 
 [tool.briefcase.app.peptide_dosage.macOS]
 requires = ["toga-cocoa~=0.5.0"]
