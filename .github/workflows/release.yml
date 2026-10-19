@@ -83,8 +83,9 @@ jobs:
           set -eu
           echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > release.keystore
 
-          ZIPALIGN=$(find "$HOME/.cache/briefcase" -iname "zipalign" -type f | sort -V | tail -1)
-          APKSIGNER=$(find "$HOME/.cache/briefcase" -iname "apksigner" -type f | sort -V | tail -1)
+          SEARCH_ROOTS="$HOME/.cache/briefcase $HOME/.android /usr/local/lib/android ${ANDROID_HOME:-} ${ANDROID_SDK_ROOT:-} /"
+          ZIPALIGN=$(find $SEARCH_ROOTS -iname "zipalign" -type f 2>/dev/null | sort -V | tail -1)
+          APKSIGNER=$(find $SEARCH_ROOTS -iname "apksigner" -type f 2>/dev/null | sort -V | tail -1)
           echo "Using zipalign: $ZIPALIGN"
           echo "Using apksigner: $APKSIGNER"
 
