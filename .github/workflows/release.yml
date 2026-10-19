@@ -32,8 +32,8 @@ jobs:
           - os: ubuntu-latest
             platform: linux
             format: system
-            build-args: --target ubuntu:jammy
-            package-args: --target ubuntu:jammy -p deb
+            build-args: --target ubuntu:noble
+            package-args: --target ubuntu:noble -p deb
           - os: windows-latest
             platform: windows
             format: app
