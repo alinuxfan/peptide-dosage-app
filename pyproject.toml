@@ -1,0 +1,33 @@
+[tool.briefcase]
+project_name = "peptide-dosage"
+bundle = "org.example"
+version = "0.1.0"
+license = "MIT"
+license-files = ["LICENSE"]
+url = "https://example.org/peptide-dosage"
+author = "Adam"
+author_email = "agjennings@gmail.com"
+
+[tool.briefcase.app.peptide_dosage]
+formal_name = "Peptide Dosage"
+description = "Peptide reconstitution dosing, titration schedules, and adherence tracking."
+sources = ["src/peptide_dosage"]
+requires = ["toga~=0.5.0"]
+
+[tool.briefcase.app.peptide_dosage.macOS]
+requires = ["toga-cocoa~=0.5.0"]
+
+[tool.briefcase.app.peptide_dosage.windows]
+requires = ["toga-winforms~=0.5.0"]
+
+[tool.briefcase.app.peptide_dosage.linux]
+requires = ["toga-gtk~=0.5.0"]
+
+[tool.briefcase.app.peptide_dosage.iOS]
+requires = ["toga-iOS~=0.5.0"]
+
+[tool.briefcase.app.peptide_dosage.android]
+requires = ["toga-android~=0.5.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
