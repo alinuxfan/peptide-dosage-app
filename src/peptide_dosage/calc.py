@@ -436,3 +436,144 @@ def convert_dose(value: float, from_unit: str, to_unit: str) -> float:
     if from_unit == "mg" and to_unit == "mcg":
         return value * 1000.0
     return value
+
+
+# Average weeks/month (365.25/12 days, divided by 7) -- same constant
+# format_vial_duration uses, so a month-based inventory projection lines up
+# with the "~X.X mos" vial-duration estimate shown elsewhere.
+WEEKS_PER_MONTH = 30.4375 / 7.0
+
+_PHASE_WEEK_RE = re.compile(r"week\s*(\d+)\s*(?:-\s*(\d+))?", re.IGNORECASE)
+
+
+def parse_phase_week_range(label: str) -> tuple[float, float | None] | None:
+    """Extract a (start_week, end_week) range from a schedule phase label.
+
+    end_week is None for an open-ended phase (e.g. "Week 17+ (Maintenance)"
+    or a bare "Week 9"), meaning it runs to the end of whatever horizon the
+    caller is projecting over. Returns None if the label doesn't mention a
+    week number at all (e.g. "Maintenance Dose", the single-step shape used
+    when a titration's start_dose == target_dose).
+    """
+    match = _PHASE_WEEK_RE.search(label or "")
+    if not match:
+        return None
+    start = float(match.group(1))
+    end = float(match.group(2)) if match.group(2) else None
+    return (start, end)
+
+
+def schedule_phase_durations(
+    schedule: list[tuple[str, float, str]],
+    horizon_weeks: float,
+) -> list[tuple[float, float, str]]:
+    """Expand a titration schedule into (weeks_in_phase, dose, unit) tuples,
+    truncated/filled to horizon_weeks.
+
+    A phase's duration comes from its "Week X-Y" label when parseable
+    (end - start + 1 weeks); an open-ended phase (no end week, or no week
+    number at all) fills whatever of the horizon remains after the earlier
+    phases. This mirrors how a titration ramp actually plays out: climb
+    through the dated steps, then hold at whatever dose the last step left
+    you on for as long as the projection runs.
+    """
+    if not schedule or horizon_weeks <= 0:
+        return []
+
+    phases: list[tuple[float, float, str]] = []
+    elapsed = 0.0
+    for i, (phase, dose, unit) in enumerate(schedule):
+        if elapsed >= horizon_weeks:
+            break
+        is_last = i == len(schedule) - 1
+        rng = parse_phase_week_range(phase)
+        if rng is None:
+            weeks = (horizon_weeks - elapsed) if is_last else 1.0
+        else:
+            start, end = rng
+            weeks = (horizon_weeks - elapsed) if end is None else (end - start + 1.0)
+        weeks = max(0.0, min(weeks, horizon_weeks - elapsed))
+        if weeks <= 0:
+            continue
+        phases.append((weeks, dose, unit))
+        elapsed += weeks
+
+    return phases
+
+
+def project_inventory(
+    schedule: list[tuple[str, float, str]] | None,
+    fallback_dose: float,
+    fallback_unit: str,
+    weekly_expected: float | None,
+    months: float,
+) -> dict | None:
+    """Project total dosing needed over `months` months of calendar time.
+
+    Walks `schedule` first so a slow titration ramp is reflected accurately
+    (lower early-phase doses, not maintenance from day one), then continues
+    at the schedule's own final dose for whatever time is left once its
+    dated phases are exhausted -- that's the ongoing maintenance level,
+    whether or not the schedule bothers to label it so. If there's no
+    schedule at all, projects fallback_dose/fallback_unit for the whole
+    horizon. Returns None if weekly_expected can't be determined: sizing an
+    order requires knowing how often doses are actually taken.
+    """
+    if weekly_expected is None or weekly_expected <= 0 or months <= 0:
+        return None
+
+    horizon_weeks = months * WEEKS_PER_MONTH
+    phases = schedule_phase_durations(schedule, horizon_weeks) if schedule else []
+    elapsed_weeks = sum(weeks for weeks, _, _ in phases)
+
+    total_mg = 0.0
+    total_doses = 0.0
+    for weeks, dose, unit in phases:
+        doses = weeks * weekly_expected
+        total_mg += doses * dose_to_mg(dose, unit)
+        total_doses += doses
+
+    remaining_weeks = max(0.0, horizon_weeks - elapsed_weeks)
+    if remaining_weeks > 0:
+        last_dose, last_unit = phases[-1][1:] if phases else (fallback_dose, fallback_unit)
+        doses = remaining_weeks * weekly_expected
+        total_mg += doses * dose_to_mg(last_dose, last_unit)
+        total_doses += doses
+
+    return {"total_mg": total_mg, "total_doses": total_doses, "horizon_weeks": horizon_weeks}
+
+
+def vials_needed(total_mg: float, vial_mg: float) -> int:
+    """Whole vials required to cover total_mg, given each vial holds vial_mg."""
+    if vial_mg <= 0 or total_mg <= 0:
+        return 0
+    return math.ceil(total_mg / vial_mg)
+
+
+def format_inventory_projection(
+    schedule: list[tuple[str, float, str]] | None,
+    fallback_dose: float,
+    fallback_unit: str,
+    weekly_expected: float | None,
+    vial_mg: float,
+    months_options: tuple[float, ...] = (1, 3, 6),
+) -> str:
+    """Human-readable multi-horizon inventory projection, e.g.:
+    "1 mo: 1,750.0 mcg (1 vial) | 3 mo: 10,500.0 mcg (3 vials) | 6 mo: ..."
+    """
+    if weekly_expected is None or weekly_expected <= 0:
+        return "Can't project inventory: dosing frequency not recognized."
+
+    parts = []
+    for months in months_options:
+        proj = project_inventory(schedule, fallback_dose, fallback_unit, weekly_expected, months)
+        if proj is None:
+            continue
+        mg = proj["total_mg"]
+        label = f"{months:.0f} mo" if months == int(months) else f"{months:.1f} mo"
+        if vial_mg > 0:
+            vials = vials_needed(mg, vial_mg)
+            parts.append(f"{label}: {mg:,.1f} mg ({vials} vial{'s' if vials != 1 else ''})")
+        else:
+            parts.append(f"{label}: {mg:,.1f} mg")
+    return " | ".join(parts) if parts else "N/A"

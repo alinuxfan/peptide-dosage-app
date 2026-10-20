@@ -302,3 +302,88 @@ def test_convert_dose_between_units():
     assert calc.convert_dose(250.0, "mcg", "mg") == 0.25
     assert calc.convert_dose(5.0, "mg", "mg") == 5.0
     assert calc.convert_dose(5.0, "iu", "mg") == 5.0  # unknown units pass through
+
+
+def test_parse_phase_week_range():
+    assert calc.parse_phase_week_range("Week 1-4") == (1.0, 4.0)
+    assert calc.parse_phase_week_range("Week 13-16 (Titration)") == (13.0, 16.0)
+    assert calc.parse_phase_week_range("Week 17+ (Maintenance)") == (17.0, None)
+    assert calc.parse_phase_week_range("Week 9") == (9.0, None)
+    assert calc.parse_phase_week_range("Maintenance Dose") is None
+    assert calc.parse_phase_week_range("") is None
+
+
+def test_schedule_phase_durations_dated_phases():
+    schedule = [("Week 1-4", 0.25, "mg"), ("Week 5-8", 0.50, "mg")]
+    # Exactly spans both 4-week phases.
+    assert calc.schedule_phase_durations(schedule, 8.0) == [(4.0, 0.25, "mg"), (4.0, 0.50, "mg")]
+    # Truncated mid-second-phase.
+    assert calc.schedule_phase_durations(schedule, 6.0) == [(4.0, 0.25, "mg"), (2.0, 0.50, "mg")]
+    # Shorter than even the first phase.
+    assert calc.schedule_phase_durations(schedule, 2.0) == [(2.0, 0.25, "mg")]
+
+
+def test_schedule_phase_durations_open_ended_last_phase():
+    schedule = [("Week 1-4 (Titration)", 0.25, "mg"), ("Week 5+ (Maintenance)", 1.0, "mg")]
+    result = calc.schedule_phase_durations(schedule, 12.0)
+    assert result == [(4.0, 0.25, "mg"), (8.0, 1.0, "mg")]
+
+
+def test_schedule_phase_durations_unparseable_label_fills_or_defaults():
+    # A single-step "Maintenance Dose" (no week number at all) fills the horizon.
+    assert calc.schedule_phase_durations([("Maintenance Dose", 2.4, "mg")], 10.0) == [(10.0, 2.4, "mg")]
+    # An unparseable *non-last* phase defaults to a single week.
+    schedule = [("Loading Phase", 1.0, "mg"), ("Week 2-5", 2.0, "mg")]
+    assert calc.schedule_phase_durations(schedule, 10.0) == [(1.0, 1.0, "mg"), (4.0, 2.0, "mg")]
+
+
+def test_project_inventory_maintenance_only():
+    # 250mcg daily (7x/week) for 1 month (~4.345 weeks) with no titration schedule.
+    proj = calc.project_inventory(None, 250.0, "mcg", 7.0, 1)
+    assert proj is not None
+    expected_doses = 1 * calc.WEEKS_PER_MONTH * 7.0
+    assert proj["total_doses"] == pytest.approx(expected_doses)
+    assert proj["total_mg"] == pytest.approx(expected_doses * 0.25)
+
+
+def test_project_inventory_titrates_then_holds_at_final_dose():
+    # Semaglutide-style ramp, weekly dosing, projected 6 months out: the
+    # schedule's dated phases (16 weeks) are used as-is, then the remainder
+    # continues at the schedule's own last dose (2.40mg), not the catalog's
+    # nominal starting dose.
+    schedule = [
+        ("Week 1-4 (Titration)", 0.25, "mg"),
+        ("Week 5-8 (Titration)", 0.50, "mg"),
+        ("Week 9-12 (Titration)", 1.00, "mg"),
+        ("Week 13-16 (Titration)", 1.70, "mg"),
+        ("Week 17+ (Maintenance)", 2.40, "mg"),
+    ]
+    proj = calc.project_inventory(schedule, 0.25, "mg", 1.0, 6)
+    assert proj is not None
+    horizon_weeks = 6 * calc.WEEKS_PER_MONTH
+    maintenance_weeks = horizon_weeks - 16.0
+    expected_mg = (0.25 * 4) + (0.50 * 4) + (1.00 * 4) + (1.70 * 4) + (2.40 * maintenance_weeks)
+    assert proj["total_mg"] == pytest.approx(expected_mg)
+
+
+def test_project_inventory_requires_parseable_frequency():
+    assert calc.project_inventory([("Week 1-4", 1.0, "mg")], 1.0, "mg", None, 3) is None
+    assert calc.project_inventory([("Week 1-4", 1.0, "mg")], 1.0, "mg", 0.0, 3) is None
+
+
+def test_vials_needed():
+    assert calc.vials_needed(10.0, 5.0) == 2
+    assert calc.vials_needed(10.1, 5.0) == 3
+    assert calc.vials_needed(0.0, 5.0) == 0
+    assert calc.vials_needed(10.0, 0.0) == 0
+
+
+def test_format_inventory_projection_includes_all_horizons_and_vial_counts():
+    text = calc.format_inventory_projection(None, 250.0, "mcg", 7.0, 5.0)
+    assert "1 mo" in text and "3 mo" in text and "6 mo" in text
+    assert "vial" in text
+
+
+def test_format_inventory_projection_unrecognized_frequency():
+    text = calc.format_inventory_projection(None, 250.0, "mcg", None, 5.0)
+    assert "not recognized" in text

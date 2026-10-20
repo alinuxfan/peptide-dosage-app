@@ -58,6 +58,15 @@ class ProtocolDetailScreen(Screen):
             lines.append(f"BUD: {calc.format_bud_label(a['bud_expiry_at'], now)}")
             lines.append(calc.format_doses_remaining(a["doses_remaining"], a["doses_total"]))
             lines.append(f"Adherence: {a['adherence_label']}")
+
+        weekly_exp = calc.parse_weekly_frequency(protocol["frequency"])
+        lines.append(
+            "Inventory needed: "
+            + calc.format_inventory_projection(
+                protocol.get("schedule"), protocol["target_dose"], protocol["dose_unit"],
+                weekly_exp, protocol["vial_mg"],
+            )
+        )
         self.status.text = "\n".join(lines)
 
         self.dose_log_box.clear()
