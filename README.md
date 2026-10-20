@@ -4,6 +4,16 @@ A cross-platform GUI port of [peptide-dosage-tui](https://github.com/alinuxfan/p
 
 Research/educational tool — not medical advice.
 
+## Screenshots
+
+| Calculator | Patients |
+|---|---|
+| ![Calculator](screenshots/calculator.png) | ![Patients](screenshots/patients.png) |
+
+| Protocol Detail (with inventory projection) | Peptide Reference |
+|---|---|
+| ![Protocol Detail](screenshots/protocol-detail.png) | ![Reference](screenshots/reference-detail.png) |
+
 ## Status
 
 Early prototype. The Calculator, Patients (protocol list + detail, dose logging, titration schedule generator), Reference (peptide list + detail + PubMed literature tracking), and profile/export screens all work end-to-end. Not yet packaged or released for any platform.
