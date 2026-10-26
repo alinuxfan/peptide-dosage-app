@@ -170,22 +170,29 @@ def format_vial_duration(doses_per_vial: float, weekly_expected: float | None, f
 def syringe_draw_status(units: float, max_capacity: float = 100.0) -> tuple[str, str]:
     """Return a short draw string and safety status for a U-100 syringe draw.
 
+    `max_capacity` is the syringe size in units (30, 50 or 100 for the usual
+    0.3/0.5/1.0 mL U-100 syringes).
+
     Returns (draw_label, safety_status).
     e.g. ("80.0 Units", "✓ Normal draw (80.0U / 100U)")
-    or ("⚠️ 160.0 Units", "⚠️ Exceeds 100U (requires 2 draws: 100U + 60.0U)")
+    or ("⚠️ 160.0 Units", "⚠️ Exceeds 100U (1x 100U + 1x 60.0U)")
     """
     if units <= 0:
         return "0.0 Units", "—"
+    if max_capacity <= 0:
+        return f"{units:.1f} Units", "—"
+    cap = f"{max_capacity:g}U"
     if units <= max_capacity:
-        return f"{units:.1f} Units", f"✓ Normal draw ({units:.1f}U / 100U)"
+        return f"{units:.1f} Units", f"✓ Normal draw ({units:.1f}U / {cap})"
 
-    draws = int(units // max_capacity)
-    remainder = units % max_capacity
+    rounded = round(units, 6)  # avoid float noise just below an exact multiple
+    draws = int(rounded // max_capacity)
+    remainder = rounded % max_capacity
     if remainder > 0.05:
-        draw_desc = f"{draws}x 100U + 1x {remainder:.1f}U"
+        draw_desc = f"{draws}x {cap} + 1x {remainder:.1f}U"
     else:
-        draw_desc = f"{draws}x 100U"
-    return f"⚠️ {units:.1f} Units", f"⚠️ Exceeds 100U ({draw_desc})"
+        draw_desc = f"{draws}x {cap}"
+    return f"⚠️ {units:.1f} Units", f"⚠️ Exceeds {cap} ({draw_desc})"
 
 
 def generate_titration_schedule(
