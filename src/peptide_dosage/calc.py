@@ -32,8 +32,30 @@ def doses_per_vial(vial_mg: float, dose_mg: float) -> float:
     return vial_mg / dose_mg
 
 
-_RANGE_X_WEEKLY_RE = re.compile(r"(\d+)\s*-\s*(\d+)\s*x", re.IGNORECASE)
-_X_WEEKLY_RE = re.compile(r"(\d+)\s*x", re.IGNORECASE)
+_PRN_RE = re.compile(r"\b(?:as[\s-]+needed|prn|as[\s-]+directed|as[\s-]+required)\b|\bmax(?:imum)?\s+\d+\s*(?:x|times)\b")
+# "5 days on / 2 days off" style cycles.
+_CYCLE_RE = re.compile(r"(\d+)\s*days?\s*on\s*[/,;]?\s*(?:and\s+)?(\d+)\s*days?\s*off")
+# "5 days a week", "3 days per week".
+_DAYS_PER_WEEK_RE = re.compile(r"(\d+)\s*days?\s*(?:a|per|/|each)\s*week")
+_EVERY_N_RE = re.compile(r"\bevery\s+(\d+)\s*(hours?|hrs?|h|days?|weeks?|wks?)\b")
+_DAILY_TO_RE = re.compile(r"\bdaily\s+to\s+(?:(\d+)\s*(?:x|times)|(twice))")
+_COUNT_WORDS = {"once": 1, "one": 1, "twice": 2, "two": 2, "thrice": 3, "three": 3, "four": 4, "five": 5}
+_COUNT_RE = re.compile(
+    r"(?<![\w.])(?:(?P<lo>\d+)(?:\s*-\s*(?P<hi>\d+))?\s*(?:(?:x|times)\b|(?=\s*(?:/|per\b|a\b|an\b)?\s*(?:day|daily|night|nightly|week|weekly|month|monthly)\b))"
+    r"|(?P<word>once|twice|thrice|one\s+time|two\s+times|three\s+times|four\s+times|five\s+times)\b)"
+)
+_PERIOD_AFTER_RE = re.compile(r"\s*(?:/|per\b|a\b|an\b|each\b|every\b)?\s*(day|daily|night|nightly|week|weekly|wk|month|monthly)")
+_DAILY_WORD_RE = re.compile(r"\b(?:daily|nightly|bid|tid)\b|/day")
+_WEEKLY_WORD_RE = re.compile(r"\b(?:weekly|week|wk)\b")
+_WEEKS_PER_MONTH_FREQ = 30.4375 / 7.0
+
+
+def _count_from_match(m: re.Match) -> float:
+    if m.group("word"):
+        return float(_COUNT_WORDS[m.group("word").split()[0]])
+    lo = int(m.group("lo"))
+    hi = int(m.group("hi")) if m.group("hi") else lo
+    return (lo + hi) / 2.0
 
 
 def parse_weekly_frequency(freq: str) -> float | None:
@@ -41,57 +63,107 @@ def parse_weekly_frequency(freq: str) -> float | None:
 
     Frequency strings are free text (e.g. "daily (at bedtime)", "3x weekly"),
     so this is a heuristic, not an exact parser -- unrecognized phrasing
-    returns None rather than guessing.
+    returns None rather than guessing. Rules:
+
+    - As-needed wording (PRN, "as directed", "max 1x/24hr") returns None: there is no schedule
+      to project or measure adherence against.
+    - "A, then B" uses B, the ongoing (maintenance) rate.
+    - Alternatives like "weekly (or twice weekly)" or "morning or split AM/PM"
+      use the first-listed base option.
+    - Ranges use the midpoint ("2-3x weekly" -> 2.5, "daily to 2x daily" -> 10.5).
+    - A bare "1-3x" next to daily/nightly counts per day, not per week.
+    - "N days on / M days off" scales the daily rate by N / (N + M).
     """
     if not freq:
         return None
     text = freq.strip().lower()
+    if not text or _PRN_RE.search(text):
+        return None
 
-    # Per-day range: e.g. '1-3x/day', '1-3x daily', '1-3 times daily'
-    day_range = re.search(r"(\d+)\s*-\s*(\d+)\s*(?:x|times)?\s*(?:/|\s*per\s*|\s*a\s*)?(?:day|daily)", text)
-    if day_range:
-        low, high = int(day_range.group(1)), int(day_range.group(2))
-        return ((low + high) / 2.0) * 7.0
+    # "daily (loading), then 2-3x weekly (maintenance)": the long-run rate wins.
+    if re.search(r"\bthen\b", text):
+        tail = re.split(r"\bthen\b", text)[-1]
+        if _parse_rate(tail) is not None:
+            text = tail
+    # Drop alternatives: "(or twice weekly)", "morning or split AM/PM".
+    text = re.sub(r"\(\s*or\b[^)]*\)|\bor\s+split\b[^),]*", " ", text)
 
-    # Per-day exact: e.g. '2x/day', '2x daily', '3 times a day'
-    day_exact = re.search(r"(\d+)\s*(?:x|times)?\s*(?:/|\s*per\s*|\s*a\s*)?(?:day|daily)", text)
-    if day_exact and not re.search(r"(?:every\s+other\s+day|\beod\b)", text):
-        return float(day_exact.group(1)) * 7.0
+    cycle_factor = 1.0
+    cycle = _CYCLE_RE.search(text)
+    if cycle:
+        on, off = int(cycle.group(1)), int(cycle.group(2))
+        if on + off > 0:
+            cycle_factor = on / (on + off)
+        text = _CYCLE_RE.sub(" ", text)
+        if not re.search(r"\d|daily|weekly|nightly|every|once|twice|thrice", text):
+            return 7.0 * cycle_factor
+    else:
+        days_wk = _DAYS_PER_WEEK_RE.search(text)
+        if days_wk:
+            cycle_factor = min(7.0, float(days_wk.group(1))) / 7.0
+            text = _DAYS_PER_WEEK_RE.sub(" ", text)
+            if not re.search(r"\d|daily|weekly|nightly|every|once|twice|thrice", text):
+                return 7.0 * cycle_factor
 
-    if "twice daily" in text or "2x daily" in text or "split am/pm" in text or re.search(r"\bbid\b", text):
-        return 14.0
-    if "three times daily" in text or "thrice daily" in text or re.search(r"\btid\b", text):
-        return 21.0
+    per_week = _parse_rate(text)
+    if per_week is None:
+        return None
+    return per_week * cycle_factor
 
-    if "every other day" in text or re.search(r"\beod\b", text) or re.search(r"\bqod\b", text):
+
+def _parse_rate(text: str) -> float | None:
+    """Doses/week from a cleaned frequency phrase (see parse_weekly_frequency)."""
+    if re.search(r"\bevery\s+other\s+day\b|\beod\b|\bqod\b", text):
         return 3.5
-
-    if "every other week" in text or "every 2 weeks" in text or re.search(r"\bq2w\b", text):
+    if re.search(r"\bevery\s+other\s+week\b|\bq2w\b", text):
         return 0.5
 
-    # Check range first so '2-3x weekly' is not matched as '3x weekly'
-    range_match = _RANGE_X_WEEKLY_RE.search(text)
-    if range_match:
-        low, high = int(range_match.group(1)), int(range_match.group(2))
-        return (low + high) / 2.0
-
-    if re.search(r"\b(?:twice|2x|2 times)\s*weekly\b", text) or text == "twice weekly":
-        return 2.0
-    if re.search(r"\b(?:three times|thrice|3x|3 times)\s*weekly\b", text):
-        return 3.0
-    if re.search(r"\b(?:four times|4x|4 times)\s*weekly\b", text):
-        return 4.0
-
-    x_match = _X_WEEKLY_RE.search(text)
-    if x_match:
-        return float(x_match.group(1))
-
-    if "daily" in text or "nightly" in text:
+    every = _EVERY_N_RE.search(text)
+    if every:
+        n, unit = int(every.group(1)), every.group(2)
+        if n <= 0:
+            return None
+        if unit.startswith("h"):
+            return 168.0 / n
+        if unit.startswith("d"):
+            return 7.0 / n
+        return 1.0 / n
+    if re.search(r"\bevery\s+(?:day|night)\b|\beach\s+(?:day|night)\b", text):
         return 7.0
-
-    if "weekly" in text:
+    if re.search(r"\bevery\s+week\b|\beach\s+week\b", text):
         return 1.0
 
+    daily_to = _DAILY_TO_RE.search(text)
+    if daily_to:
+        high = 2 if daily_to.group(2) else int(daily_to.group(1))
+        return ((1 + high) / 2.0) * 7.0
+
+    count_m = _COUNT_RE.search(text)
+    if count_m:
+        count = _count_from_match(count_m)
+        period = _PERIOD_AFTER_RE.match(text, count_m.end())
+        if period:
+            unit = period.group(1)
+        elif _DAILY_WORD_RE.search(text):
+            unit = "day"
+        else:
+            unit = "week"
+        if unit in ("day", "daily", "night", "nightly"):
+            return count * 7.0
+        if unit.startswith("month"):
+            return count / _WEEKS_PER_MONTH_FREQ
+        return count
+
+    if re.search(r"\bbid\b|split\s*am\s*/\s*pm", text):
+        return 14.0
+    if re.search(r"\btid\b", text):
+        return 21.0
+    if re.search(r"\bmonthly\b", text):
+        return 1.0 / _WEEKS_PER_MONTH_FREQ
+    if re.search(r"\b(?:daily|nightly)\b", text):
+        return 7.0
+    if _WEEKLY_WORD_RE.search(text):
+        return 1.0
     return None
 
 
@@ -210,6 +282,8 @@ def generate_titration_schedule(
         raise ValueError("Start and target dose must be greater than 0.")
     if weeks_per_step <= 0:
         raise ValueError("Weeks per step must be greater than 0.")
+    if weeks_per_step < 0.1:
+        raise ValueError("Weeks per step must be at least 0.1.")
 
     if start_dose == target_dose:
         return [("Maintenance Dose", round(target_dose, 2), unit)]
@@ -219,30 +293,50 @@ def generate_titration_schedule(
 
     direction = 1 if target_dose > start_dose else -1
     dose = start_dose
-    week_start = 1
+    week_start = 1.0  # 1-based week position where the current step begins
     schedule: list[tuple[str, float, str]] = []
 
-    for _ in range(max_steps):
-        week_end = week_start + weeks_per_step - 1
-        label = f"Week {week_start:.0f}-{week_end:.0f}"
+    for step in range(max_steps):
+        # Computed from the step index (not accumulated) so rounding never drifts.
+        next_start = round(1.0 + (step + 1) * weeks_per_step, 2)
+        label = _titration_step_label(week_start, next_start)
         next_dose = dose + step_increment * direction
 
         reached_target = (
-            (direction == 1 and next_dose >= target_dose)
-            or (direction == -1 and next_dose <= target_dose)
+            (direction == 1 and next_dose >= target_dose - 1e-9)
+            or (direction == -1 and next_dose <= target_dose + 1e-9)
         )
+        schedule.append((label, round(dose, 2), unit))
         if reached_target:
-            schedule.append((label, round(dose, 2), unit))
-            schedule.append((f"Week {week_end + 1:.0f}+ (Maintenance)", round(target_dose, 2), unit))
+            schedule.append((f"Week {_fmt_week(next_start)}+ (Maintenance)", round(target_dose, 2), unit))
             return schedule
 
-        schedule.append((label, round(dose, 2), unit))
         dose = next_dose
-        week_start = week_end + 1
+        week_start = next_start
 
     # Safety cap reached without converging -- pin the final step at target anyway.
-    schedule.append((f"Week {week_start:.0f}+ (Maintenance)", round(target_dose, 2), unit))
+    schedule.append((f"Week {_fmt_week(week_start)}+ (Maintenance)", round(target_dose, 2), unit))
     return schedule
+
+
+def _fmt_week(value: float) -> str:
+    """Week number without a trailing ".0" (3.0 -> "3", 2.5 -> "2.5")."""
+    value = round(value, 2)
+    return str(int(value)) if value == int(value) else f"{value:g}"
+
+
+def _titration_step_label(start: float, next_start: float) -> str:
+    """Label for a step covering week positions [start, next_start).
+
+    Whole-week steps use the inclusive form ("Week 3-4", or "Week 3" for a
+    single week). Fractional steps can't (the end of "Week 1-0.5" is
+    nonsense), so they use a half-open range ("Week 1-1.5" = from the start
+    of week 1 up to, not including, 1.5) -- parse_phase_week_range reads both.
+    """
+    if start == int(start) and next_start == int(next_start):
+        end = int(next_start) - 1
+        return f"Week {int(start)}" if end == int(start) else f"Week {int(start)}-{end}"
+    return f"Week {_fmt_week(start)}-{_fmt_week(next_start)}"
 
 
 def split_vial_aliquots(vial_mg: float, water_ml: float, num_splits: int) -> dict:
@@ -443,24 +537,66 @@ def convert_dose(value: float, from_unit: str, to_unit: str) -> float:
 # with the "~X.X mos" vial-duration estimate shown elsewhere.
 WEEKS_PER_MONTH = 30.4375 / 7.0
 
-_PHASE_WEEK_RE = re.compile(r"week\s*(\d+)\s*(?:-\s*(\d+))?", re.IGNORECASE)
+_PHASE_RE = re.compile(
+    r"\b(?P<unit>weeks?|days?)\s*(?P<start>\d+(?:\.\d+)?)\s*(?:(?P<plus>\+)|[-–]\s*(?P<end>\d+(?:\.\d+)?))?",
+    re.IGNORECASE,
+)
+_COURSE_WORD_RE = re.compile(r"\bcourse\b", re.IGNORECASE)
+
+
+def _parse_phase(label: str) -> tuple[float, float | None] | None:
+    """(start_week_position, duration_weeks) for a phase label, or None.
+
+    duration_weeks is None for an open-ended phase ("Week 17+", bare "Week 9").
+    Weeks are 1-based positions. "Week 1-4" is inclusive (4 weeks); a range
+    with a fractional end point ("Week 1-1.5", "Week 1.5-3") is half-open, as
+    generate_titration_schedule writes for fractional steps. "Days 1-10" is
+    10 days = 10/7 weeks.
+    """
+    match = _PHASE_RE.search(label or "")
+    if not match:
+        return None
+    first = float(match.group("start"))
+    last = float(match.group("end")) if match.group("end") else None
+    if match.group("unit").lower().startswith("day"):
+        start = 1.0 + (first - 1.0) / 7.0
+        return (start, None if last is None else max(0.0, last - first + 1.0) / 7.0)
+    if last is None:
+        return (first, None)
+    if first == int(first) and last == int(last):
+        return (first, max(0.0, last - first + 1.0))
+    return (first, max(0.0, last - first))
 
 
 def parse_phase_week_range(label: str) -> tuple[float, float | None] | None:
     """Extract a (start_week, end_week) range from a schedule phase label.
 
-    end_week is None for an open-ended phase (e.g. "Week 17+ (Maintenance)"
-    or a bare "Week 9"), meaning it runs to the end of whatever horizon the
-    caller is projecting over. Returns None if the label doesn't mention a
-    week number at all (e.g. "Maintenance Dose", the single-step shape used
-    when a titration's start_dose == target_dose).
+    The phase covers start_week..end_week inclusive, i.e. it lasts
+    end_week - start_week + 1 weeks. end_week is None for an open-ended phase
+    (e.g. "Week 17+ (Maintenance)" or a bare "Week 9"), meaning it runs to the
+    end of whatever horizon the caller is projecting over. "Days 1-10" is
+    converted to weeks (10 days = 10/7 weeks) and fractional ranges like
+    "Week 1-1.5" are half-open; see _parse_phase. Returns None if the label
+    doesn't mention a week/day number at all (e.g. "Maintenance Dose", the
+    single-step shape used when a titration's start_dose == target_dose).
     """
-    match = _PHASE_WEEK_RE.search(label or "")
-    if not match:
+    parsed = _parse_phase(label)
+    if parsed is None:
         return None
-    start = float(match.group(1))
-    end = float(match.group(2)) if match.group(2) else None
-    return (start, end)
+    start, duration = parsed
+    return (start, None if duration is None else start + duration - 1.0)
+
+
+def is_bounded_course(label: str) -> bool:
+    """True when a phase label describes a finite course.
+
+    That is a "Days X-Y" range, or a "Course" label with an explicit end
+    ("Week 1-4 (Course)"); an open-ended "Week 5+" never is.
+    """
+    match = _PHASE_RE.search(label or "")
+    if not match or match.group("end") is None:
+        return False
+    return match.group("unit").lower().startswith("day") or bool(_COURSE_WORD_RE.search(label))
 
 
 def schedule_phase_durations(
@@ -470,28 +606,36 @@ def schedule_phase_durations(
     """Expand a titration schedule into (weeks_in_phase, dose, unit) tuples,
     truncated/filled to horizon_weeks.
 
-    A phase's duration comes from its "Week X-Y" label when parseable
-    (end - start + 1 weeks); an open-ended phase (no end week, or no week
-    number at all) fills whatever of the horizon remains after the earlier
-    phases. This mirrors how a titration ramp actually plays out: climb
+    A phase's duration comes from its "Week X-Y" / "Days X-Y" label when
+    parseable; an open-ended last phase (no end, or no week number at all)
+    fills whatever of the horizon remains after the earlier phases, while an
+    open-ended earlier phase (bare "Week 3") lasts until the next phase
+    starts. This mirrors how a titration ramp actually plays out: climb
     through the dated steps, then hold at whatever dose the last step left
     you on for as long as the projection runs.
     """
     if not schedule or horizon_weeks <= 0:
         return []
 
+    parsed = [_parse_phase(phase) for phase, _, _ in schedule]
     phases: list[tuple[float, float, str]] = []
     elapsed = 0.0
     for i, (phase, dose, unit) in enumerate(schedule):
         if elapsed >= horizon_weeks:
             break
         is_last = i == len(schedule) - 1
-        rng = parse_phase_week_range(phase)
+        rng = parsed[i]
         if rng is None:
             weeks = (horizon_weeks - elapsed) if is_last else 1.0
         else:
-            start, end = rng
-            weeks = (horizon_weeks - elapsed) if end is None else (end - start + 1.0)
+            start, duration = rng
+            if duration is not None:
+                weeks = duration
+            elif is_last:
+                weeks = horizon_weeks - elapsed
+            else:
+                nxt = parsed[i + 1]
+                weeks = (nxt[0] - start) if nxt is not None and nxt[0] > start else 1.0
         weeks = max(0.0, min(weeks, horizon_weeks - elapsed))
         if weeks <= 0:
             continue
@@ -514,7 +658,9 @@ def project_inventory(
     (lower early-phase doses, not maintenance from day one), then continues
     at the schedule's own final dose for whatever time is left once its
     dated phases are exhausted -- that's the ongoing maintenance level,
-    whether or not the schedule bothers to label it so. If there's no
+    whether or not the schedule bothers to label it so. The exception is a
+    finite course ("Days 1-10 (Course)"): its last phase is not extended, so
+    the result is just the course (`bounded` is True). If there's no
     schedule at all, projects fallback_dose/fallback_unit for the whole
     horizon. Returns None if weekly_expected can't be determined: sizing an
     order requires knowing how often doses are actually taken.
@@ -525,6 +671,7 @@ def project_inventory(
     horizon_weeks = months * WEEKS_PER_MONTH
     phases = schedule_phase_durations(schedule, horizon_weeks) if schedule else []
     elapsed_weeks = sum(weeks for weeks, _, _ in phases)
+    bounded = bool(schedule) and is_bounded_course(schedule[-1][0])
 
     total_mg = 0.0
     total_doses = 0.0
@@ -534,13 +681,20 @@ def project_inventory(
         total_doses += doses
 
     remaining_weeks = max(0.0, horizon_weeks - elapsed_weeks)
-    if remaining_weeks > 0:
+    if remaining_weeks > 0 and not bounded:
         last_dose, last_unit = phases[-1][1:] if phases else (fallback_dose, fallback_unit)
         doses = remaining_weeks * weekly_expected
         total_mg += doses * dose_to_mg(last_dose, last_unit)
         total_doses += doses
+        elapsed_weeks = horizon_weeks
 
-    return {"total_mg": total_mg, "total_doses": total_doses, "horizon_weeks": horizon_weeks}
+    return {
+        "total_mg": total_mg,
+        "total_doses": total_doses,
+        "horizon_weeks": horizon_weeks,
+        "course_weeks": elapsed_weeks,
+        "bounded": bounded and elapsed_weeks < horizon_weeks,
+    }
 
 
 def vials_needed(total_mg: float, vial_mg: float) -> int:
@@ -560,20 +714,35 @@ def format_inventory_projection(
 ) -> str:
     """Human-readable multi-horizon inventory projection, e.g.:
     "1 mo: 1,750.0 mcg (1 vial) | 3 mo: 10,500.0 mcg (3 vials) | 6 mo: ..."
+
+    Totals are shown in the protocol's own dose unit (mcg or mg), taken from
+    the schedule's final dose, else fallback_unit. Vial counts always use mg.
     """
     if weekly_expected is None or weekly_expected <= 0:
         return "Can't project inventory: dosing frequency not recognized."
 
+    unit = schedule[-1][2] if schedule else fallback_unit
+    unit = "mcg" if unit == "mcg" else "mg"
+
     parts = []
+    course_weeks = None
     for months in months_options:
         proj = project_inventory(schedule, fallback_dose, fallback_unit, weekly_expected, months)
         if proj is None:
             continue
         mg = proj["total_mg"]
+        shown = convert_dose(mg, "mg", unit)
         label = f"{months:.0f} mo" if months == int(months) else f"{months:.1f} mo"
         if vial_mg > 0:
             vials = vials_needed(mg, vial_mg)
-            parts.append(f"{label}: {mg:,.1f} mg ({vials} vial{'s' if vials != 1 else ''})")
+            parts.append(f"{label}: {shown:,.1f} {unit} ({vials} vial{'s' if vials != 1 else ''})")
         else:
-            parts.append(f"{label}: {mg:,.1f} mg")
-    return " | ".join(parts) if parts else "N/A"
+            parts.append(f"{label}: {shown:,.1f} {unit}")
+        if proj["bounded"]:
+            course_weeks = proj["course_weeks"]
+    if not parts:
+        return "N/A"
+    text = " | ".join(parts)
+    if course_weeks is not None:
+        text += f" (course ends after ~{course_weeks:.1f} wks)"
+    return text

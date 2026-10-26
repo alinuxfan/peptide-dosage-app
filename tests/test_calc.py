@@ -65,10 +65,98 @@ def test_parse_weekly_frequency_multi_daily_and_intervals():
     assert calc.parse_weekly_frequency("twice daily") == 14.0
     assert calc.parse_weekly_frequency("daily (intranasal, 1-3x/day)") == 14.0
     assert calc.parse_weekly_frequency("daily (intranasal, split AM/PM)") == 14.0
-    assert calc.parse_weekly_frequency("daily (SubQ injection, morning or split AM/PM)") == 14.0
+    # "morning or split AM/PM" is an optional alternative: the base is once daily.
+    assert calc.parse_weekly_frequency("daily (SubQ injection, morning or split AM/PM)") == 7.0
     assert calc.parse_weekly_frequency("daily (SubQ injection, morning)") == 7.0
     assert calc.parse_weekly_frequency("every other day") == 3.5
     assert calc.parse_weekly_frequency("every 2 weeks") == 0.5
+
+
+@pytest.mark.parametrize(
+    "freq, expected",
+    [
+        ("daily (1-3x, pre-meal)", 14.0),
+        ("daily (1-3x)", 14.0),
+        ("every 2 days", 3.5),
+        ("every 3 days", 7.0 / 3.0),
+        ("every 10 days", 0.7),
+        ("every day", 7.0),
+        ("every 12 hours", 14.0),
+        ("every 3 weeks", 1.0 / 3.0),
+        ("5 days on / 2 days off", 5.0),
+        ("3 days on, 1 day off", 3.0 * 7.0 / 4.0),
+        ("5 days a week", 5.0),
+        ("once a day", 7.0),
+        ("once daily", 7.0),
+        ("once a week", 1.0),
+        ("twice a week", 2.0),
+        ("twice daily", 14.0),
+        ("three times daily", 21.0),
+        ("3 times a day", 21.0),
+        ("2x/day", 14.0),
+        ("1-3 times daily", 14.0),
+        ("daily to 2x daily", 10.5),
+        ("weekly (or twice weekly)", 1.0),
+        ("2 daily", 14.0),
+        ("2/day", 14.0),
+        ("3 a day", 21.0),
+        ("3 per day", 21.0),
+        ("3 per week", 3.0),
+        ("4 weekly", 4.0),
+        ("3x daily, 5 days a week", 15.0),
+        ("3x weekly, max 12 weeks", 3.0),
+        ("daily (max 10 days)", 7.0),
+        ("3x weekly, then stop", 3.0),
+        ("daily, strengthening phase", 7.0),
+        ("max 1x/24hr", None),
+        ("as needed (PRN), 45 min before activity, max 1x/24hr", None),
+        ("as directed (intranasal), up to 4x daily", None),
+    ],
+)
+def test_parse_weekly_frequency_edge_phrasings(freq, expected):
+    result = calc.parse_weekly_frequency(freq)
+    if expected is None:
+        assert result is None
+    else:
+        assert result == pytest.approx(expected)
+
+
+CATALOG_FREQUENCIES = {
+    "daily": 7.0,
+    "daily (before bed)": 7.0,
+    "daily (at bedtime)": 7.0,
+    "nightly (before bed)": 7.0,
+    "daily (SubQ injection, morning or split AM/PM)": 7.0,
+    "daily (SubQ injection, morning)": 7.0,
+    "daily (short course)": 7.0,
+    "daily (post-workout)": 7.0,
+    "daily (topical)": 7.0,
+    "daily (1-3x, pre-meal)": 14.0,
+    "daily (1-3x)": 14.0,
+    "daily to 2x daily": 10.5,
+    "daily (loading), then 2-3x weekly (maintenance)": 2.5,
+    "weekly": 1.0,
+    "weekly (or twice weekly)": 1.0,
+    "twice weekly": 2.0,
+    "2x weekly": 2.0,
+    "2x weekly (loading)": 2.0,
+    "3x weekly": 3.0,
+    "3x weekly (short course)": 3.0,
+    "2-3x weekly": 2.5,
+    "1-2x weekly": 1.5,
+    "as needed (PRN), 45 min before activity, max 1x/24hr": None,
+    "as directed (intranasal), up to 4x daily": None,
+}
+
+
+def test_parse_weekly_frequency_all_catalog_strings():
+    from peptide_dosage import db
+
+    seen = {p["freq"] for p in db.DEFAULT_PEPTIDES}
+    # Every catalog frequency must be covered here so new ones get reviewed.
+    assert seen <= set(CATALOG_FREQUENCIES), seen - set(CATALOG_FREQUENCIES)
+    for freq in seen:
+        assert calc.parse_weekly_frequency(freq) == CATALOG_FREQUENCIES[freq], freq
 
 
 def test_parse_weekly_frequency_unrecognized():
@@ -197,6 +285,59 @@ def test_generate_titration_schedule_max_steps_cap():
     assert schedule[-1] == ("Week 6+ (Maintenance)", 1000.0, "mg")
 
 
+def test_generate_titration_schedule_half_week_steps():
+    schedule = calc.generate_titration_schedule(1.0, 3.0, 1.0, 0.5, "mg")
+    assert schedule == [
+        ("Week 1-1.5", 1.0, "mg"),
+        ("Week 1.5-2", 2.0, "mg"),
+        ("Week 2+ (Maintenance)", 3.0, "mg"),
+    ]
+    # No "Week 1-0" / "Week 2-1" style inverted labels, and the durations read back correctly.
+    assert calc.schedule_phase_durations(schedule, 6.0) == [(0.5, 1.0, "mg"), (0.5, 2.0, "mg"), (5.0, 3.0, "mg")]
+
+
+def test_generate_titration_schedule_one_and_a_half_week_steps_do_not_overlap():
+    schedule = calc.generate_titration_schedule(1.0, 4.0, 1.0, 1.5, "mg")
+    assert [label for label, _, _ in schedule] == [
+        "Week 1-2.5", "Week 2.5-4", "Week 4-5.5", "Week 5.5+ (Maintenance)",
+    ]
+    durations = calc.schedule_phase_durations(schedule, 12.0)
+    assert [w for w, _, _ in durations] == [1.5, 1.5, 1.5, 7.5]
+
+
+def test_generate_titration_schedule_single_week_steps():
+    schedule = calc.generate_titration_schedule(1.0, 3.0, 1.0, 1.0, "mg")
+    assert [label for label, _, _ in schedule] == ["Week 1", "Week 2", "Week 3+ (Maintenance)"]
+    # A bare "Week N" mid-schedule lasts until the next phase starts.
+    assert calc.schedule_phase_durations(schedule, 6.0) == [(1.0, 1.0, "mg"), (1.0, 2.0, "mg"), (4.0, 3.0, "mg")]
+
+
+def test_generate_titration_schedule_rejects_tiny_steps():
+    with pytest.raises(ValueError):
+        calc.generate_titration_schedule(1.0, 3.0, 1.0, 0.00001, "mg")
+
+
+def test_generate_titration_schedule_third_week_steps_sum_to_whole_weeks():
+    schedule = calc.generate_titration_schedule(1.0, 2.0, 0.5, 1 / 3, "mg")
+    durations = calc.schedule_phase_durations(schedule, 3.0)
+    assert sum(w for w, _, _ in durations) == pytest.approx(3.0)
+    assert durations[0][0] + durations[1][0] == pytest.approx(0.67)
+
+
+def test_is_bounded_course():
+    assert calc.is_bounded_course("Days 1-10 (Course 1)")
+    assert calc.is_bounded_course("Week 1-4 (Course)")
+    assert not calc.is_bounded_course("Week 5+ (Maintenance Course)")
+    assert not calc.is_bounded_course("Week 1-4 (Titration)")
+    assert not calc.is_bounded_course("Maintenance Dose")
+
+
+def test_generate_titration_schedule_float_increment_reaches_target():
+    schedule = calc.generate_titration_schedule(0.1, 0.4, 0.1, 1.0, "mg")
+    assert [dose for _, dose, _ in schedule] == [0.1, 0.2, 0.3, 0.4]
+    assert schedule[-1][0].endswith("(Maintenance)")
+
+
 def test_split_vial_aliquots_even_split():
     result = calc.split_vial_aliquots(10.0, 2.0, 4)
     assert result == {"aliquot_mg": 2.5, "aliquot_ml": 0.5, "concentration_mg_ml": 5.0}
@@ -313,6 +454,47 @@ def test_parse_phase_week_range():
     assert calc.parse_phase_week_range("") is None
 
 
+def test_parse_phase_week_range_days_and_fractions():
+    # Days are converted to weeks: 10 days = 10/7 weeks (end - start + 1).
+    start, end = calc.parse_phase_week_range("Days 1-10 (Course)")
+    assert start == 1.0
+    assert end - start + 1 == pytest.approx(10.0 / 7.0)
+    # Fractional ranges are half-open: "Week 1-1.5" lasts half a week.
+    start, end = calc.parse_phase_week_range("Week 1-1.5")
+    assert end - start + 1 == pytest.approx(0.5)
+    assert calc.parse_phase_week_range("Week 5.5+ (Maintenance)") == (5.5, None)
+
+
+def test_schedule_phase_durations_days_phases():
+    schedule = [("Days 1-10 (Course 1)", 100.0, "mcg"), ("Days 1-10 (Course 2, next cycle)", 200.0, "mcg")]
+    result = calc.schedule_phase_durations(schedule, 26.0)
+    assert result == [(pytest.approx(10 / 7), 100.0, "mcg"), (pytest.approx(10 / 7), 200.0, "mcg")]
+
+
+def test_project_inventory_bounded_course_not_extended():
+    schedule = [("Days 1-10 (Course)", 5.0, "mg")]
+    for months in (1, 3, 6):
+        proj = calc.project_inventory(schedule, 5.0, "mg", 7.0, months)
+        assert proj["total_doses"] == pytest.approx(10.0)
+        assert proj["total_mg"] == pytest.approx(50.0)
+        assert proj["bounded"] is True
+    # Horizon shorter than the course just truncates it.
+    short = calc.project_inventory([("Days 1-20 (Extended Course)", 10.0, "mg")], 10.0, "mg", 7.0, 0.1)
+    assert short["bounded"] is False
+    assert short["total_doses"] == pytest.approx(0.1 * calc.WEEKS_PER_MONTH * 7.0)
+
+
+def test_project_inventory_catalog_course_peptides_are_bounded():
+    from peptide_dosage import db
+
+    for name in ("Epithalon", "Pinealon", "Thymalin", "Cartalax", "FOXO4-DRI"):
+        pep = next(p for p in db.DEFAULT_PEPTIDES if p["name"] == name)
+        weekly = calc.parse_weekly_frequency(pep["freq"])
+        proj = calc.project_inventory(pep["schedule"], pep["dose"], pep["unit"], weekly, 6)
+        assert proj["bounded"] is True, name
+        assert proj["course_weeks"] < 6, name
+
+
 def test_schedule_phase_durations_dated_phases():
     schedule = [("Week 1-4", 0.25, "mg"), ("Week 5-8", 0.50, "mg")]
     # Exactly spans both 4-week phases.
@@ -382,6 +564,25 @@ def test_format_inventory_projection_includes_all_horizons_and_vial_counts():
     text = calc.format_inventory_projection(None, 250.0, "mcg", 7.0, 5.0)
     assert "1 mo" in text and "3 mo" in text and "6 mo" in text
     assert "vial" in text
+
+
+def test_format_inventory_projection_uses_real_dose_unit():
+    # 250 mcg daily: 1 mo ~= 7,609 mcg, shown as mcg (not mislabelled "mg").
+    mcg_text = calc.format_inventory_projection(None, 250.0, "mcg", 7.0, 5.0)
+    assert "mcg" in mcg_text and "1 mo: 7,609.4 mcg (2 vials)" in mcg_text
+    assert " mg" not in mcg_text
+    # Same dose entered in mg stays in mg.
+    mg_text = calc.format_inventory_projection(None, 0.25, "mg", 7.0, 5.0)
+    assert "1 mo: 7.6 mg (2 vials)" in mg_text
+    # The schedule's own unit wins over the fallback.
+    sched_text = calc.format_inventory_projection([("Week 1-4", 250.0, "mcg")], 0.25, "mg", 7.0, 5.0)
+    assert "mcg" in sched_text
+
+
+def test_format_inventory_projection_notes_bounded_course():
+    text = calc.format_inventory_projection([("Days 1-10 (Course)", 5.0, "mg")], 5.0, "mg", 7.0, 50.0)
+    assert "1 mo: 50.0 mg (1 vial)" in text and "6 mo: 50.0 mg (1 vial)" in text
+    assert "course ends after ~1.4 wks" in text
 
 
 def test_format_inventory_projection_unrecognized_frequency():
