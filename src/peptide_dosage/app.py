@@ -14,11 +14,15 @@ from .screens.more import MoreScreen
 
 class PeptideDosageApp(toga.App):
     def startup(self):
-        db.set_db_path(self.paths.data / "peptides.db")
+        # The data folder must exist before the database is created in it.
         os.makedirs(self.paths.data, exist_ok=True)
+        db.set_db_path(self.paths.data / "peptides.db")
         db.init_db()
 
-        self.main_window = toga.MainWindow(title=self.formal_name)
+        # Phone-shaped default size for desktop windows (width, height); the
+        # layout is built for narrow screens. Android/iOS ignore this and
+        # always fill the screen.
+        self.main_window = toga.MainWindow(title=self.formal_name, size=(420, 680))
 
         root = toga.Box(style=Pack(direction=COLUMN, flex=1))
         destinations = {
@@ -36,6 +40,11 @@ class PeptideDosageApp(toga.App):
 
 
 def main():
+    # WARNING: do not change this app_id (nor the bundle, formal_name, or
+    # author in pyproject.toml). Depending on the platform, Toga derives the
+    # per-user data folder from some of these, and that folder holds the
+    # SQLite database with every user's protocols and dose logs; changing
+    # them could silently orphan existing data.
     return PeptideDosageApp("Peptide Dosage", "org.example.peptidedosage")
 
 

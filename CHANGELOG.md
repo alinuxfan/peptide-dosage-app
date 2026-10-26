@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+Bug fixes
+- Dosing math, database, and PubMed (NCBI) handling fixes.
+- Protocol creation fixes.
+- Scrolling fixes on long screens.
+
+Features
+- Dose log editing.
+- Calculator presets.
+- Literature tracker improvements.
+- Profile management.
+- Phone-shaped default window size on desktop.
+
+Packaging and CI
+- New "Build check" workflow: every PR runs `briefcase create` + `build` for Linux, Windows, macOS, and Android.
+- Tests now run on Ubuntu, Windows, and macOS.
+- Android: explicit INTERNET permission and the Material theme/dependency Toga 0.5 expects.
+- README documents supported platforms (iOS is intentionally unsupported), install steps, and CI.
+
 ## 0.1.0
 
 Initial prototype: Calculator, Patients (protocol list/detail, dose logging,
