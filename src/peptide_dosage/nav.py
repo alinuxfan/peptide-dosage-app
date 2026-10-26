@@ -4,6 +4,26 @@ Toga has no built-in mobile navigation widget (OptionContainer renders as
 desktop-style top tabs). This swaps the visible content of a single root
 box between a bottom tab bar and a per-tab stack of screens, each screen
 a plain toga.Box built by a factory function.
+
+Scrolling: every screen is wrapped in a vertical-only toga.ScrollContainer
+so long lists/forms stay reachable on phone-sized displays; the TabBar lives
+outside the scroller so it stays pinned to the bottom. Layout notes for
+screen authors: inside a scroller the height is unbounded, so a ``flex=1``
+child can only grow to fill the *viewport* (Toga hands the content at least
+the viewport size, and more when its natural height is larger). Flex children
+without a natural height (e.g. a MultilineTextInput) therefore give no
+guarantee of a useful height on short screens -- give those an explicit
+``height`` in their Pack style if they need to stay usable.
+
+View caching: the built (scroller, box) of each screen on the stack is kept
+for as long as the screen is on the stack. Popping back to a screen re-shows
+the same widgets (typed inputs survive; scroll position survives unless the
+screen itself clears and refills its widgets) and then calls
+``on_shown`` so it can refresh any data that changed meanwhile. Screens must
+therefore do their data refreshing in ``on_shown``, not only in ``build``.
+
+Android hardware Back: Toga 0.5 (toga-android) exposes no back-press hook
+(no ``on_back``/``onBackPressed`` on App or Window), so nothing is wired here.
 """
 
 import toga
@@ -36,22 +56,49 @@ class NavigationController:
     def __init__(self, root_factory, window=None):
         self.window = window  # set by the App, so screens can show dialogs
         self._stack = [root_factory(self)]
+        self._views = {}  # screen -> ScrollContainer, for screens on the stack
         self.content = toga.Box(style=Pack(direction=COLUMN, flex=1))
         self._render()
 
     def push(self, screen_factory):
-        self._stack.append(screen_factory(self))
-        self._render()
+        screen = screen_factory(self)
+        self._stack.append(screen)
+        try:
+            self._render()
+        except Exception:
+            # build() failed: keep the stack consistent with what is visible.
+            if screen in self._stack:
+                self._stack.remove(screen)
+            self._views.pop(screen, None)
+            raise
 
     def pop(self):
         if len(self._stack) > 1:
-            self._stack.pop()
+            self._views.pop(self._stack.pop(), None)
             self._render()
-            self._stack[-1].on_shown()
+            self.notify_shown()
+
+    def notify_shown(self):
+        """Tell the visible screen it (re)appeared; called after rendering."""
+        self._stack[-1].on_shown()
+
+    def _view_for(self, screen) -> toga.ScrollContainer:
+        view = self._views.get(screen)
+        if view is None:
+            view = toga.ScrollContainer(content=screen.build(), horizontal=False, style=Pack(flex=1))
+            self._views[screen] = view
+        return view
 
     def _render(self):
+        screen = self._stack[-1]
+        view = self._view_for(screen)
+        if self._stack[-1] is not screen:
+            # build() popped its own screen (e.g. its record no longer
+            # exists); the previous screen has already been rendered.
+            self._views.pop(screen, None)
+            return
         self.content.clear()
-        self.content.add(self._stack[-1].build())
+        self.content.add(view)
 
 
 class TabBar:
@@ -82,4 +129,4 @@ class TabBar:
         self.root_content.clear()
         self.root_content.add(self.destinations[label].content)
         self.root_content.add(self.bar)
-        self.destinations[label]._stack[-1].on_shown()
+        self.destinations[label].notify_shown()
