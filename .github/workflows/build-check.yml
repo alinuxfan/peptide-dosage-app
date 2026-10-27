@@ -1,0 +1,60 @@
+name: Build check
+
+# Verifies on every PR / push to master that the app still *builds* on every
+# supported platform (Linux, Windows, macOS, Android) so packaging breakage is
+# caught before a release tag is pushed. This only runs `briefcase create` and
+# `briefcase build` -- no packaging, signing, notarization, or secrets -- and
+# produces no artifacts. See release.yml for the real release pipeline. iOS is
+# intentionally not supported.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: build-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }} ${{ matrix.format }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            format: system
+            # Builds inside a Docker container matching the target distro.
+            target-args: --target ubuntu:noble
+          - os: windows-latest
+            platform: windows
+            format: app
+            target-args: ""
+          - os: macos-latest
+            platform: macOS
+            format: app
+            target-args: ""
+          - os: ubuntu-latest
+            platform: android
+            format: gradle
+            target-args: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install Briefcase
+        run: python -m pip install briefcase
+
+      - name: Create
+        run: briefcase create ${{ matrix.platform }} ${{ matrix.format }} --no-input ${{ matrix.target-args }}
+
+      - name: Build
+        run: briefcase build ${{ matrix.platform }} ${{ matrix.format }} --no-input ${{ matrix.target-args }}
