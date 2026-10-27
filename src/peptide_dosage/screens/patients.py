@@ -19,6 +19,7 @@ from .protocol_detail import ProtocolDetailScreen
 
 CARD_STYLE = Pack(direction=COLUMN, background_color="#1f2d3a", margin=(0, 12, 10, 12), gap=4)
 TITLE_STYLE = Pack(font_size=15, font_weight="bold", color="#e8eef3")
+HINT_STYLE = Pack(color="#b8c4ce", margin=(12, 0))
 PILL_OK = Pack(background_color="#2e7d32", color="#e8f5e9", font_size=11, margin=(2, 0))
 PILL_WARN = Pack(background_color="#f9a825", color="#2a2100", font_size=11, margin=(2, 0))
 PILL_OVERDUE = Pack(background_color="#c62828", color="#ffebee", font_size=11, margin=(2, 0))
@@ -38,38 +39,60 @@ class PatientsScreen(Screen):
     def build(self) -> toga.Box:
         self.profile_select = toga.Selection(on_change=self._on_profile_change)
         self.card_list = toga.Box(style=Pack(direction=COLUMN, flex=1))
+        self._profiles_by_name = {}
+        self._last_name = getattr(self, "_last_name", None)  # build() re-runs after a pop; keep the selection
         return toga.Box(
             style=Pack(direction=COLUMN, margin=12),
-            children=[self.profile_select, self.card_list],
+            children=[
+                self.profile_select,
+                toga.Button("Add protocol", on_press=self._add_protocol, style=Pack(margin=(6, 0))),
+                self.card_list,
+            ],
         )
 
     def on_shown(self):
         profiles = db.get_profiles()
         self._profiles_by_name = {p["name"]: p["id"] for p in profiles}
-        current = self.profile_select.value
+        current = self.profile_select.value or self._last_name
         self.profile_select.items = [p["name"] for p in profiles]
         if profiles:
             self.profile_select.value = current if current in self._profiles_by_name else profiles[0]["name"]
         self._refresh_cards()
 
     def _on_profile_change(self, widget):
+        if self.profile_select.value is not None:
+            self._last_name = self.profile_select.value
         self._refresh_cards()
+
+    def _selected_profile_id(self):
+        return self._profiles_by_name.get(self.profile_select.value)
+
+    def _add_protocol(self, widget):
+        profile_id = self._selected_profile_id()
+        if profile_id is None:
+            return  # no profile selected; the empty-state label explains how to create one
+        from ..dialogs.protocol_form import ProtocolFormScreen
+        self.nav.push(lambda nav: ProtocolFormScreen(nav, profile_id, on_saved=self._refresh_cards))
 
     def _refresh_cards(self):
         self.card_list.clear()
-        name = self.profile_select.value
-        if name is None:
+        profile_id = self._selected_profile_id()
+        if profile_id is None:
+            self.card_list.add(toga.Label(
+                "No profile yet. Create one in the More tab, then add protocols here.", style=HINT_STYLE,
+            ))
             return
-        profile_id = self._profiles_by_name[name]
         protocols = db.get_user_protocols(profile_id)
         adherence_by_id = {a["protocol_id"]: a for a in db.get_protocol_adherence(profile_id)}
         now = datetime.now(timezone.utc).replace(tzinfo=None)
+        if not protocols:
+            self.card_list.add(toga.Label("No protocols yet — tap Add protocol.", style=HINT_STYLE))
         for protocol in protocols:
             self.card_list.add(self._make_card(protocol, adherence_by_id.get(protocol["id"]), now))
 
     def _make_card(self, protocol, adherence, now) -> toga.Box:
         title = toga.Label(
-            f"{protocol['peptide_name']} — {protocol['target_dose']}{protocol['dose_unit']}",
+            f"{protocol['peptide_name']} — {protocol['target_dose']:g} {protocol['dose_unit']}",
             style=TITLE_STYLE,
         )
         badges = toga.Box(style=Pack(direction=ROW, gap=8))
@@ -80,6 +103,10 @@ class PatientsScreen(Screen):
             ))
             badges.add(toga.Label(
                 calc.format_doses_remaining(adherence["doses_remaining"], adherence["doses_total"]),
+                style=Pack(font_size=11, color="#b8c4ce"),
+            ))
+            badges.add(toga.Label(
+                "Next: " + calc.format_due_label(adherence["next_due_at"], now),
                 style=Pack(font_size=11, color="#b8c4ce"),
             ))
         return toga.Box(

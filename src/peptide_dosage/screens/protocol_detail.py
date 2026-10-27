@@ -27,6 +27,7 @@ class ProtocolDetailScreen(Screen):
                 toga.Button("< Back", on_press=lambda w: self.nav.pop()),
                 self.status,
                 toga.Button("Log a dose", on_press=self._log_dose),
+                toga.Button("Edit protocol", on_press=self._edit_protocol),
                 toga.Button("Mark reconstituted (new vial)", on_press=self._mark_reconstituted),
                 toga.Button("Generate titration schedule", on_press=self._generate_schedule),
                 toga.Button("Delete protocol", on_press=self._delete),
@@ -77,6 +78,12 @@ class ProtocolDetailScreen(Screen):
                            + (f" — {entry['notes']}" if entry["notes"] else "")),
             ])
             self.dose_log_box.add(row)
+
+    def _edit_protocol(self, widget):
+        from ..dialogs.protocol_form import ProtocolFormScreen
+        self.nav.push(lambda nav: ProtocolFormScreen(
+            nav, self.protocol["profile_id"], protocol=self.protocol, on_saved=self._refresh,
+        ))
 
     def _log_dose(self, widget):
         from ..dialogs.log_dose import LogDoseScreen
