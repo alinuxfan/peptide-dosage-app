@@ -1,7 +1,9 @@
 import sqlite3
+import io
 import json
 import os
 import csv
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from . import calc
@@ -992,9 +994,42 @@ def get_connection():
     return conn
 
 
-def init_db():
+@contextmanager
+def _db():
+    """Yield a connection that is always closed, even if the body raises.
+    Un-committed work is discarded on error. (Leaked handles keep the file
+    locked on Windows.)"""
     conn = get_connection()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _utc_now():
+    """Naive UTC datetime, matching SQLite's CURRENT_TIMESTAMP strings."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _utc_now_str():
+    return _utc_now().strftime(TIMESTAMP_FORMAT)
+
+
+# PRAGMA user_version values. Bump when adding a one-shot data migration.
+_SCHEMA_VERSION = 1
+
+
+def init_db():
+    with _db() as conn:
+        _init_db(conn)
+
+
+def _init_db(conn):
     cursor = conn.cursor()
+    user_version = cursor.execute("PRAGMA user_version").fetchone()[0]
 
     # Table for profiles (people)
     cursor.execute("""
@@ -1037,15 +1072,18 @@ def init_db():
         schedule_json TEXT,
         sources_json TEXT,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (profile_id) REFERENCES profiles(id) ON DELETE CASCADE
     )
     """)
 
-    # created_at wasn't in the original schema; ALTER TABLE ADD COLUMN isn't
-    # idempotent, so guard it with a table_info check before adding it.
+    # created_at wasn't in the original schema. ALTER TABLE ADD COLUMN isn't
+    # idempotent, so guard it with a table_info check. SQLite rejects a
+    # non-constant default (CURRENT_TIMESTAMP) on ADD COLUMN for tables that
+    # already hold rows, so add it bare and backfill below.
     existing_columns = {row["name"] for row in cursor.execute("PRAGMA table_info(user_protocols)")}
     if "created_at" not in existing_columns:
-        cursor.execute("ALTER TABLE user_protocols ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        cursor.execute("ALTER TABLE user_protocols ADD COLUMN created_at TIMESTAMP")
     # When the current vial was reconstituted -- drives beyond-use-date (BUD)
     # warnings and "doses left in this vial" inventory. NULL = not reconstituted.
     if "reconstituted_at" not in existing_columns:
@@ -1065,6 +1103,19 @@ def init_db():
         notes TEXT,
         FOREIGN KEY (profile_id) REFERENCES profiles(id) ON DELETE CASCADE
     )
+    """)
+
+    # Backfill legacy rows with the best available approximation of creation
+    # time: the earlier of the last edit (updated_at) and the first logged
+    # dose, so a protocol edited recently doesn't look brand new and lose its
+    # dose history.
+    first_dose = "(SELECT MIN(taken_at) FROM dose_log WHERE protocol_id = user_protocols.id)"
+    cursor.execute(f"""
+    UPDATE user_protocols
+    SET created_at = MIN(
+        COALESCE({first_dose}, updated_at, CURRENT_TIMESTAMP),
+        COALESCE(updated_at, {first_dose}, CURRENT_TIMESTAMP))
+    WHERE created_at IS NULL
     """)
 
     # Table for literature tracking / PubMed article cache
@@ -1101,33 +1152,36 @@ def init_db():
     cursor.execute("UPDATE peptides SET name = 'Tesamorelin' WHERE name = 'Tesemorelin'")
     cursor.execute("UPDATE user_protocols SET peptide_name = 'Tesamorelin' WHERE peptide_name = 'Tesemorelin'")
 
-    # Migration: Selank and Semax updated from intranasal sprays to
-    # subcutaneous (SubQ) injection protocols for both catalog templates and
-    # existing patient protocols.
-    for p in DEFAULT_PEPTIDES:
-        if p["name"] in ("Selank", "Semax"):
-            cursor.execute("""
-            UPDATE peptides
-            SET freq = ?, notes = ?, schedule_json = ?, sources_json = ?
-            WHERE name = ? AND (freq LIKE '%intranasal%' OR notes LIKE '%intranasal%')
-            """, (
-                p["freq"],
-                p["notes"],
-                json.dumps(p["schedule"]),
-                json.dumps(p["sources"]),
-                p["name"]
-            ))
-            cursor.execute("""
-            UPDATE user_protocols
-            SET frequency = ?, notes = ?, schedule_json = ?, sources_json = ?
-            WHERE peptide_name = ? AND (frequency LIKE '%intranasal%' OR notes LIKE '%intranasal%')
-            """, (
-                p["freq"],
-                p["notes"],
-                json.dumps(p["schedule"]),
-                json.dumps(p["sources"]),
-                p["name"]
-            ))
+    # One-shot migration (schema version 1): Selank and Semax updated from
+    # intranasal sprays to subcutaneous (SubQ) injection protocols for both
+    # catalog templates and existing patient protocols. Gated on
+    # PRAGMA user_version so it runs once and never overwrites a protocol the
+    # user edits afterwards (e.g. writes their own "intranasal" note).
+    if user_version < 1:
+        for p in DEFAULT_PEPTIDES:
+            if p["name"] in ("Selank", "Semax"):
+                cursor.execute("""
+                UPDATE peptides
+                SET freq = ?, notes = ?, schedule_json = ?, sources_json = ?
+                WHERE name = ? AND (freq LIKE '%intranasal%' OR notes LIKE '%intranasal%')
+                """, (
+                    p["freq"],
+                    p["notes"],
+                    json.dumps(p["schedule"]),
+                    json.dumps(p["sources"]),
+                    p["name"]
+                ))
+                cursor.execute("""
+                UPDATE user_protocols
+                SET frequency = ?, notes = ?, schedule_json = ?, sources_json = ?
+                WHERE peptide_name = ? AND (frequency LIKE '%intranasal%' OR notes LIKE '%intranasal%')
+                """, (
+                    p["freq"],
+                    p["notes"],
+                    json.dumps(p["schedule"]),
+                    json.dumps(p["sources"]),
+                    p["name"]
+                ))
 
     # Populate default master peptides
     for p in DEFAULT_PEPTIDES:
@@ -1147,31 +1201,35 @@ def init_db():
         ))
 
     conn.commit()
-    conn.close()
+    if user_version < _SCHEMA_VERSION:
+        # PRAGMA doesn't accept bound parameters; the value is a module constant.
+        conn.execute(f"PRAGMA user_version = {int(_SCHEMA_VERSION)}")
+        conn.commit()
+
+
+def _protocol_row_to_dict(row):
+    d = dict(row)
+    d["schedule"] = json.loads(d["schedule_json"]) if d["schedule_json"] else []
+    d["sources"] = json.loads(d["sources_json"]) if d["sources_json"] else []
+    return d
 
 
 # Profile Management Functions
 def get_profiles():
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM profiles ORDER BY name ASC")
-    rows = cursor.fetchall()
-    conn.close()
+    with _db() as conn:
+        rows = conn.execute("SELECT * FROM profiles ORDER BY name ASC").fetchall()
     return [dict(row) for row in rows]
 
 
 def add_profile(name, notes=""):
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("INSERT INTO profiles (name, notes) VALUES (?, ?)", (name, notes))
-        conn.commit()
-        profile_id = cursor.lastrowid
-        conn.close()
-        return profile_id
-    except sqlite3.IntegrityError:
-        conn.close()
-        return None
+    """Create a profile. Returns its id, or None if the name already exists."""
+    with _db() as conn:
+        try:
+            cursor = conn.execute("INSERT INTO profiles (name, notes) VALUES (?, ?)", (name, notes))
+            conn.commit()
+            return cursor.lastrowid
+        except sqlite3.IntegrityError:
+            return None
 
 
 def delete_profile(profile_id):
@@ -1180,26 +1238,24 @@ def delete_profile(profile_id):
     Refuses to delete the last remaining profile so the app always has at
     least one valid profile to fall back to. Returns False if refused.
     """
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) as count FROM profiles")
-    if cursor.fetchone()["count"] <= 1:
-        conn.close()
-        return False
-    cursor.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
-    conn.commit()
-    conn.close()
+    with _db() as conn:
+        # Single statement so the "last profile" check and the delete can't race.
+        cursor = conn.execute(
+            "DELETE FROM profiles WHERE id = ? AND (SELECT COUNT(*) FROM profiles) > 1", (profile_id,)
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            # Nothing deleted: either refused (last profile) or the id never existed.
+            count = conn.execute("SELECT COUNT(*) as count FROM profiles").fetchone()["count"]
+            return count > 1
     return True
 
 
 # Master Peptide Functions
 def get_peptides():
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM peptides ORDER BY name ASC")
-    rows = cursor.fetchall()
-    conn.close()
-    
+    with _db() as conn:
+        rows = conn.execute("SELECT * FROM peptides ORDER BY name ASC").fetchall()
+
     result = []
     for row in rows:
         d = dict(row)
@@ -1210,11 +1266,9 @@ def get_peptides():
 
 
 def get_peptide_by_name(name):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM peptides WHERE name = ?", (name,))
-    row = cursor.fetchone()
-    conn.close()
+    """Look up a catalog peptide by exact name; None if unknown (or name is None)."""
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM peptides WHERE name = ?", (name,)).fetchone()
     if row:
         d = dict(row)
         d["schedule"] = json.loads(d["schedule_json"]) if d["schedule_json"] else []
@@ -1225,88 +1279,68 @@ def get_peptide_by_name(name):
 
 # Patient Protocol Functions
 def get_user_protocols(profile_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM user_protocols WHERE profile_id = ? ORDER BY updated_at DESC", (profile_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    
-    result = []
-    for row in rows:
-        d = dict(row)
-        d["schedule"] = json.loads(d["schedule_json"]) if d["schedule_json"] else []
-        d["sources"] = json.loads(d["sources_json"]) if d["sources_json"] else []
-        result.append(d)
-    return result
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM user_protocols WHERE profile_id = ? ORDER BY updated_at DESC", (profile_id,)
+        ).fetchall()
+    return [_protocol_row_to_dict(row) for row in rows]
 
 
 def get_user_protocol_by_id(protocol_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM user_protocols WHERE id = ?", (protocol_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        d = dict(row)
-        d["schedule"] = json.loads(d["schedule_json"]) if d["schedule_json"] else []
-        d["sources"] = json.loads(d["sources_json"]) if d["sources_json"] else []
-        return d
-    return None
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM user_protocols WHERE id = ?", (protocol_id,)).fetchone()
+    return _protocol_row_to_dict(row) if row else None
 
 
 def add_or_update_user_protocol(profile_id, peptide_name, vial_mg, water_ml, target_dose, dose_unit, frequency, notes, schedule, sources):
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    # Check if this peptide already exists for the profile
-    cursor.execute("SELECT id FROM user_protocols WHERE profile_id = ? AND peptide_name = ?", (profile_id, peptide_name))
-    existing = cursor.fetchone()
-    
     schedule_json = json.dumps(schedule)
     sources_json = json.dumps(sources)
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
-    if existing:
-        cursor.execute("""
-        UPDATE user_protocols 
-        SET vial_mg = ?, water_ml = ?, target_dose = ?, dose_unit = ?, frequency = ?, notes = ?, schedule_json = ?, sources_json = ?, updated_at = ?
-        WHERE id = ?
-        """, (vial_mg, water_ml, target_dose, dose_unit, frequency, notes, schedule_json, sources_json, now, existing["id"]))
-    else:
-        cursor.execute("""
-        INSERT INTO user_protocols (profile_id, peptide_name, vial_mg, water_ml, target_dose, dose_unit, frequency, notes, schedule_json, sources_json, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (profile_id, peptide_name, vial_mg, water_ml, target_dose, dose_unit, frequency, notes, schedule_json, sources_json, now))
-        
-    conn.commit()
-    conn.close()
+    now = _utc_now_str()
+
+    with _db() as conn:
+        # Check if this peptide already exists for the profile
+        existing = conn.execute(
+            "SELECT id FROM user_protocols WHERE profile_id = ? AND peptide_name = ?", (profile_id, peptide_name)
+        ).fetchone()
+
+        if existing:
+            conn.execute("""
+            UPDATE user_protocols
+            SET vial_mg = ?, water_ml = ?, target_dose = ?, dose_unit = ?, frequency = ?, notes = ?, schedule_json = ?, sources_json = ?, updated_at = ?
+            WHERE id = ?
+            """, (vial_mg, water_ml, target_dose, dose_unit, frequency, notes, schedule_json, sources_json, now, existing["id"]))
+        else:
+            # created_at is set explicitly: on legacy DBs the column was added
+            # without a default.
+            conn.execute("""
+            INSERT INTO user_protocols (profile_id, peptide_name, vial_mg, water_ml, target_dose, dose_unit, frequency, notes, schedule_json, sources_json, updated_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (profile_id, peptide_name, vial_mg, water_ml, target_dose, dose_unit, frequency, notes, schedule_json, sources_json, now, now))
+
+        conn.commit()
 
 
 def delete_user_protocol(protocol_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    # dose_log rows deliberately outlive their protocol (peptide_name is
-    # denormalized for exactly this reason), but protocol_id has no cascading FK,
-    # so null it rather than leaving it pointing at a row that no longer exists.
-    cursor.execute("UPDATE dose_log SET protocol_id = NULL WHERE protocol_id = ?", (protocol_id,))
-    cursor.execute("DELETE FROM user_protocols WHERE id = ?", (protocol_id,))
-    conn.commit()
-    conn.close()
+    with _db() as conn:
+        # dose_log rows deliberately outlive their protocol (peptide_name is
+        # denormalized for exactly this reason), but protocol_id has no cascading FK,
+        # so null it rather than leaving it pointing at a row that no longer exists.
+        conn.execute("UPDATE dose_log SET protocol_id = NULL WHERE protocol_id = ?", (protocol_id,))
+        conn.execute("DELETE FROM user_protocols WHERE id = ?", (protocol_id,))
+        conn.commit()
 
 
 def set_protocol_reconstituted(protocol_id, when=None):
     """Mark a protocol's vial as reconstituted now (or at `when`), starting a
     fresh beyond-use-date window and resetting the vial's dose inventory.
     Pass when=False to clear the date (vial not reconstituted)."""
-    conn = get_connection()
-    cursor = conn.cursor()
     if when is False:
         value = None
     else:
-        value = when or datetime.now(timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S')
-    cursor.execute("UPDATE user_protocols SET reconstituted_at = ? WHERE id = ?", (value, protocol_id))
-    conn.commit()
-    conn.close()
+        value = when or _utc_now_str()
+    with _db() as conn:
+        conn.execute("UPDATE user_protocols SET reconstituted_at = ? WHERE id = ?", (value, protocol_id))
+        conn.commit()
     return value
 
 
@@ -1314,75 +1348,116 @@ def update_protocol_schedule(protocol_id, schedule, target_dose, dose_unit):
     """Overwrite a protocol's titration schedule (e.g. from the Titration
     Schedule Generator), also syncing target_dose/dose_unit to the new
     maintenance level so dose logging/adherence reflect the updated plan."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    cursor.execute("""
-    UPDATE user_protocols
-    SET schedule_json = ?, target_dose = ?, dose_unit = ?, updated_at = ?
-    WHERE id = ?
-    """, (json.dumps(schedule), target_dose, dose_unit, now, protocol_id))
-    conn.commit()
-    conn.close()
+    now = _utc_now_str()
+    with _db() as conn:
+        conn.execute("""
+        UPDATE user_protocols
+        SET schedule_json = ?, target_dose = ?, dose_unit = ?, updated_at = ?
+        WHERE id = ?
+        """, (json.dumps(schedule), target_dose, dose_unit, now, protocol_id))
+        conn.commit()
 
 
 # Dose Log Functions
 def log_dose(profile_id, protocol_id, peptide_name, dose_amount, dose_unit, notes="", taken_at=None):
     """Record a dose. `taken_at` ("YYYY-MM-DD HH:MM:SS", naive UTC) backdates a
     dose that was taken earlier but logged late; None means "right now"."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    if taken_at:
-        cursor.execute("""
-        INSERT INTO dose_log (profile_id, protocol_id, peptide_name, dose_amount, dose_unit, notes, taken_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (profile_id, protocol_id, peptide_name, dose_amount, dose_unit, notes, taken_at))
-    else:
-        cursor.execute("""
-        INSERT INTO dose_log (profile_id, protocol_id, peptide_name, dose_amount, dose_unit, notes)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """, (profile_id, protocol_id, peptide_name, dose_amount, dose_unit, notes))
-    conn.commit()
-    conn.close()
+    with _db() as conn:
+        if taken_at:
+            conn.execute("""
+            INSERT INTO dose_log (profile_id, protocol_id, peptide_name, dose_amount, dose_unit, notes, taken_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (profile_id, protocol_id, peptide_name, dose_amount, dose_unit, notes, taken_at))
+        else:
+            conn.execute("""
+            INSERT INTO dose_log (profile_id, protocol_id, peptide_name, dose_amount, dose_unit, notes)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """, (profile_id, protocol_id, peptide_name, dose_amount, dose_unit, notes))
+        conn.commit()
 
 
 def get_dose_log_entry_by_id(log_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM dose_log WHERE id = ?", (log_id,))
-    row = cursor.fetchone()
-    conn.close()
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM dose_log WHERE id = ?", (log_id,)).fetchone()
     return dict(row) if row else None
 
 
 def update_dose_log_entry(log_id, dose_amount, dose_unit, taken_at, notes=""):
     """Correct an already-logged dose (wrong amount, wrong date, missing note)."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-    UPDATE dose_log
-    SET dose_amount = ?, dose_unit = ?, taken_at = ?, notes = ?
-    WHERE id = ?
-    """, (dose_amount, dose_unit, taken_at, notes, log_id))
-    conn.commit()
-    conn.close()
+    with _db() as conn:
+        conn.execute("""
+        UPDATE dose_log
+        SET dose_amount = ?, dose_unit = ?, taken_at = ?, notes = ?
+        WHERE id = ?
+        """, (dose_amount, dose_unit, taken_at, notes, log_id))
+        conn.commit()
 
 
 def get_dose_log(profile_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM dose_log WHERE profile_id = ? ORDER BY taken_at DESC", (profile_id,))
-    rows = cursor.fetchall()
-    conn.close()
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM dose_log WHERE profile_id = ? ORDER BY taken_at DESC", (profile_id,)
+        ).fetchall()
     return [dict(row) for row in rows]
 
 
 def delete_dose_log_entry(log_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM dose_log WHERE id = ?", (log_id,))
-    conn.commit()
-    conn.close()
+    with _db() as conn:
+        conn.execute("DELETE FROM dose_log WHERE id = ?", (log_id,))
+        conn.commit()
+
+
+def _parse_ts(text):
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, TIMESTAMP_FORMAT)
+    except (ValueError, TypeError):
+        return None
+
+
+def _current_phase_dose_mg(schedule, weeks_elapsed, default_dose_mg):
+    """Dose (mg) for the titration phase active `weeks_elapsed` weeks after the
+    protocol started, or default_dose_mg when there is no usable schedule.
+
+    Phases are matched by the week numbers in their labels ("Week 3-4",
+    "Week 9+ (Maintenance)"); phases without a parseable week label are
+    ignored. Before the first phase the first dose applies; past the last
+    dated phase the final phase's dose applies.
+    """
+    parsed = []
+    for step in schedule or []:
+        try:
+            label, dose, unit = step
+            rng = calc.parse_phase_week_range(label)
+            if rng is None:
+                continue
+            parsed.append((rng[0], rng[1], calc.dose_to_mg(float(dose), unit)))
+        except (TypeError, ValueError):
+            continue
+    if not parsed:
+        return default_dose_mg
+
+    # Exclusive upper bound (in week numbers) of each phase. "Week 3-4" covers
+    # [3, 5). A bare "Week 2" / "Week 2+" runs until the next phase starts; only
+    # the final phase may be open-ended.
+    bounded = []
+    for i, (start, end, dose_mg) in enumerate(parsed):
+        if end is not None:
+            upper = end + 1.0
+        elif i + 1 < len(parsed):
+            upper = parsed[i + 1][0]
+        else:
+            upper = float("inf")
+        bounded.append((upper, dose_mg))
+
+    week_no = weeks_elapsed + 1.0  # "Week 1" is the first week
+    chosen = bounded[-1][1]
+    for upper, dose_mg in bounded:
+        if week_no < upper:
+            chosen = dose_mg
+            break
+    return chosen if chosen > 0 else default_dose_mg
 
 
 def get_protocol_adherence(profile_id):
@@ -1398,196 +1473,227 @@ def get_protocol_adherence(profile_id):
     Also computes next_due_at (a datetime, or None if unmeasurable) from
     the same weekly-expected figure, anchored off the most recent logged
     dose (or the protocol's created_at if none has been logged yet).
+
+    Vial inventory (doses_used/doses_total/doses_remaining) counts only doses
+    since the current vial started (reconstituted_at, falling back to the
+    protocol's created_at) and sizes a dose from the titration phase that is
+    active now when a schedule exists.
     """
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, peptide_name, frequency, created_at, reconstituted_at, vial_mg, target_dose, dose_unit "
-        "FROM user_protocols WHERE profile_id = ? ORDER BY peptide_name ASC",
-        (profile_id,)
-    )
-    protocols = cursor.fetchall()
-
-    now = datetime.now(timezone.utc).replace(tzinfo=None)  # naive, to match SQLite's UTC CURRENT_TIMESTAMP strings
-    result = []
-    for p in protocols:
+    with _db() as conn:
+        cursor = conn.cursor()
         cursor.execute(
-            "SELECT COUNT(*) as count, MAX(taken_at) as last_taken FROM dose_log WHERE protocol_id = ?",
-            (p["id"],)
+            "SELECT id, peptide_name, frequency, created_at, reconstituted_at, vial_mg, target_dose, dose_unit, schedule_json "
+            "FROM user_protocols WHERE profile_id = ? ORDER BY peptide_name ASC",
+            (profile_id,)
         )
-        log_row = cursor.fetchone()
-        logged_count = log_row["count"]
+        protocols = cursor.fetchall()
 
-        created_dt = None
-        if p["created_at"]:
-            try:
-                created_dt = datetime.strptime(p["created_at"], "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                created_dt = None
-
-        days_elapsed = 0.0
-        if created_dt:
-            days_elapsed = max(0.0, (now - created_dt).total_seconds() / 86400.0)
-
-        last_taken_dt = None
-        if log_row["last_taken"]:
-            try:
-                last_taken_dt = datetime.strptime(log_row["last_taken"], "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                last_taken_dt = None
-
-        weekly_expected = calc.parse_weekly_frequency(p["frequency"] or "")
-        adherence_pct = calc.adherence_percent(logged_count, weekly_expected, days_elapsed)
-        next_due_at = calc.next_dose_due_at(weekly_expected, last_taken_dt, created_dt)
-
-        reconstituted_dt = None
-        if p["reconstituted_at"]:
-            try:
-                reconstituted_dt = datetime.strptime(p["reconstituted_at"], "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                reconstituted_dt = None
-
-        # Vial inventory counts only doses drawn from the *current* vial, so it
-        # resets whenever the protocol is marked reconstituted again.
-        if reconstituted_dt:
+        now = _utc_now()  # naive, to match SQLite's UTC CURRENT_TIMESTAMP strings
+        result = []
+        for p in protocols:
             cursor.execute(
-                "SELECT COUNT(*) as count FROM dose_log WHERE protocol_id = ? AND taken_at >= ?",
-                (p["id"], p["reconstituted_at"])
+                "SELECT COUNT(*) as count, MAX(taken_at) as last_taken FROM dose_log WHERE protocol_id = ?",
+                (p["id"],)
             )
-            doses_used = cursor.fetchone()["count"]
-        else:
-            doses_used = logged_count
+            log_row = cursor.fetchone()
+            logged_count = log_row["count"]
 
-        dose_mg = calc.dose_to_mg(p["target_dose"], p["dose_unit"])
-        total_doses = calc.doses_per_vial(p["vial_mg"], dose_mg)
+            created_dt = _parse_ts(p["created_at"])
 
-        result.append({
-            "protocol_id": p["id"],
-            "peptide_name": p["peptide_name"],
-            "frequency": p["frequency"],
-            "logged_count": logged_count,
-            "adherence_pct": adherence_pct,
-            "adherence_label": calc.adherence_label(adherence_pct, weekly_expected, days_elapsed),
-            "next_due_at": next_due_at,
-            "reconstituted_at": reconstituted_dt,
-            "bud_expiry_at": calc.bud_expiry_at(reconstituted_dt),
-            "bud_exceeded": calc.bud_exceeded_by_duration(total_doses, weekly_expected),
-            "doses_used": doses_used,
-            "doses_total": total_doses,
-            "doses_remaining": calc.doses_remaining(total_doses, doses_used),
-        })
+            days_elapsed = 0.0
+            if created_dt:
+                days_elapsed = max(0.0, (now - created_dt).total_seconds() / 86400.0)
 
-    conn.close()
+            last_taken_dt = _parse_ts(log_row["last_taken"])
+
+            weekly_expected = calc.parse_weekly_frequency(p["frequency"] or "")
+            adherence_pct = calc.adherence_percent(logged_count, weekly_expected, days_elapsed)
+            next_due_at = calc.next_dose_due_at(weekly_expected, last_taken_dt, created_dt)
+
+            reconstituted_dt = _parse_ts(p["reconstituted_at"])
+
+            # Vial inventory counts only doses drawn from the *current* vial: since
+            # reconstitution, or (never reconstituted) since the protocol started.
+            vial_start = p["reconstituted_at"] if reconstituted_dt else (p["created_at"] if created_dt else None)
+            if vial_start:
+                cursor.execute(
+                    "SELECT COUNT(*) as count FROM dose_log WHERE protocol_id = ? AND taken_at >= ?",
+                    (p["id"], vial_start)
+                )
+                doses_used = cursor.fetchone()["count"]
+            else:
+                doses_used = logged_count
+
+            try:
+                schedule = json.loads(p["schedule_json"]) if p["schedule_json"] else []
+            except (ValueError, TypeError):
+                schedule = []
+            target_dose_mg = calc.dose_to_mg(p["target_dose"], p["dose_unit"])
+            dose_mg = _current_phase_dose_mg(schedule, days_elapsed / 7.0, target_dose_mg)
+            total_doses = calc.doses_per_vial(p["vial_mg"], dose_mg)
+
+            result.append({
+                "protocol_id": p["id"],
+                "peptide_name": p["peptide_name"],
+                "frequency": p["frequency"],
+                "logged_count": logged_count,
+                "adherence_pct": adherence_pct,
+                "adherence_label": calc.adherence_label(adherence_pct, weekly_expected, days_elapsed),
+                "next_due_at": next_due_at,
+                "reconstituted_at": reconstituted_dt,
+                "bud_expiry_at": calc.bud_expiry_at(reconstituted_dt),
+                "bud_exceeded": calc.bud_exceeded_by_duration(total_doses, weekly_expected),
+                "doses_used": doses_used,
+                "doses_total": total_doses,
+                "doses_remaining": calc.doses_remaining(total_doses, doses_used),
+            })
+
     return result
 
 
-def export_person_reference_sheet(profile_id, dest_dir=None):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM profiles WHERE id = ?", (profile_id,))
-    prof = cursor.fetchone()
-    if not prof:
-        conn.close()
-        return None
-    profile_name = prof["name"]
-    
-    protocols = get_user_protocols(profile_id)
-    conn.close()
-    
-    filename = f"patient_{calc.safe_filename_part(profile_name)}_peptides_summary.txt"
-    filepath = os.path.join(dest_dir or os.getcwd(), filename)
-    
-    with open(filepath, "w") as f:
-        f.write("=" * 72 + "\n")
-        f.write(f" PATIENT PEPTIDE PROTOCOL REFERENCE SHEET: {profile_name.upper()}\n")
-        f.write("=" * 72 + "\n")
-        f.write(f"Date Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Total Tracked Peptides: {len(protocols)}\n")
-        f.write("=" * 72 + "\n\n")
-        
-        if not protocols:
-            f.write("No active peptide protocols assigned for this person.\n")
-        else:
-            for i, p in enumerate(protocols, 1):
-                f.write(f"[{i}] PEPTIDE: {p['peptide_name'].upper()}\n")
-                f.write("-" * 50 + "\n")
-                conc_mg_ml = calc.concentration_mg_ml(p['vial_mg'], p['water_ml'])
-                conc_mcg_ml = conc_mg_ml * 1000.0
-                dose_mg = calc.dose_to_mg(p['target_dose'], p['dose_unit'])
-                vol_ml = calc.draw_volume_ml(dose_mg, conc_mg_ml)
-                units = calc.syringe_units(vol_ml)
-                
-                f.write(f"• Vial Size:           {p['vial_mg']:.1f} mg\n")
-                f.write(f"• BAC Water Added:     {p['water_ml']:.1f} mL\n")
-                f.write(f"• Solution Strength:   {conc_mg_ml:.2f} mg/mL ({conc_mcg_ml:,.0f} mcg/mL)\n")
-                f.write(f"• Prescribed Dose:     {p['target_dose']} {p['dose_unit']} ({p['frequency']})\n")
-                f.write(f"• U-100 Syringe Draw:  {units:.1f} Units ({vol_ml:.3f} mL)\n")
-                f.write(f"• Clinical Notes:      {p['notes']}\n")
-                
-                if p['schedule']:
-                    f.write("\n  Titration Schedule:\n")
-                    phase_width = max(20, max((len(phase) for phase, _, _ in p['schedule']), default=20))
-                    header = f"  {'Phase':<{phase_width}} | {'Dose':<10} | {'Syringe Draw':<15}"
-                    f.write(header + "\n")
-                    f.write("  " + "-" * (len(header) - 2) + "\n")
-                    for phase, d_val, u_unit in p['schedule']:
-                        d_mg = calc.dose_to_mg(d_val, u_unit)
-                        v_ml = calc.draw_volume_ml(d_mg, conc_mg_ml)
-                        u_draw = calc.syringe_units(v_ml)
-                        d_str = f"{d_val:.0f} mcg" if u_unit == 'mcg' else f"{d_val:.2f} mg"
-                        f.write(f"  {phase:<{phase_width}} | {d_str:<10} | {u_draw:.1f} Units\n")
-                        
-                if p['sources']:
-                    f.write("\n  Scientific Citations & Literature:\n")
-                    for s in p['sources']:
-                        f.write(f"  - {s['title']} (PMID: {s['pmid']})\n")
-                        f.write(f"    URL: {s['url']}\n")
-                        
-                f.write("\n" + "=" * 72 + "\n\n")
+def _write_new_file(dest_dir, stem, ext, text, newline=None):
+    """Write `text` (UTF-8) to a brand-new file `<stem><ext>` in dest_dir
+    (default: cwd; created if missing). Never overwrites: if the name is
+    taken -- by an earlier export, or because two profile names flatten to the
+    same safe filename -- a numeric suffix is appended (`stem_2.ext`, ...).
 
-        dose_log = get_dose_log(profile_id)[:10]
-        if dose_log:
-            f.write("RECENT DOSE LOG (Last 10 Entries)\n")
-            f.write("-" * 72 + "\n")
-            for entry in dose_log:
-                notes_suffix = f" — {entry['notes']}" if entry['notes'] else ""
-                f.write(f"  {entry['taken_at']}  {entry['peptide_name']}: {entry['dose_amount']} {entry['dose_unit']}{notes_suffix}\n")
-            f.write("\n" + "=" * 72 + "\n")
+    Returns the final filename (no directory). OSError (unwritable folder,
+    disk full, ...) propagates to the caller after removing any partial file.
+    """
+    directory = dest_dir or os.getcwd()
+    os.makedirs(directory, exist_ok=True)
 
+    attempt = 1
+    while True:
+        filename = f"{stem}{ext}" if attempt == 1 else f"{stem}_{attempt}{ext}"
+        filepath = os.path.join(directory, filename)
+        try:
+            # "x" = exclusive create: fails atomically instead of overwriting.
+            f = open(filepath, "x", encoding="utf-8", newline=newline)
+        except FileExistsError:
+            attempt += 1
+            if attempt > 10000:
+                raise
+            continue
+        break
+
+    try:
+        with f:
+            f.write(text)
+    except BaseException:
+        try:
+            os.remove(filepath)
+        except OSError:
+            pass
+        raise
     return filename
 
 
+def export_person_reference_sheet(profile_id, dest_dir=None):
+    """Write a plain-text (UTF-8) reference sheet for a profile into dest_dir
+    (default: cwd, created if missing). Returns the filename, or None if the
+    profile doesn't exist. Never overwrites an existing file (a numeric suffix
+    is added). Raises OSError if the file can't be written."""
+    with _db() as conn:
+        prof = conn.execute("SELECT name FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+    if not prof:
+        return None
+    profile_name = prof["name"]
+
+    protocols = get_user_protocols(profile_id)
+    dose_log = get_dose_log(profile_id)[:10]
+
+    f = io.StringIO()
+    f.write("=" * 72 + "\n")
+    f.write(f" PATIENT PEPTIDE PROTOCOL REFERENCE SHEET: {profile_name.upper()}\n")
+    f.write("=" * 72 + "\n")
+    f.write(f"Date Exported: {_utc_now_str()} UTC\n")
+    f.write(f"Total Tracked Peptides: {len(protocols)}\n")
+    f.write("=" * 72 + "\n\n")
+
+    if not protocols:
+        f.write("No active peptide protocols assigned for this person.\n")
+    else:
+        for i, p in enumerate(protocols, 1):
+            f.write(f"[{i}] PEPTIDE: {p['peptide_name'].upper()}\n")
+            f.write("-" * 50 + "\n")
+            conc_mg_ml = calc.concentration_mg_ml(p['vial_mg'], p['water_ml'])
+            conc_mcg_ml = conc_mg_ml * 1000.0
+            dose_mg = calc.dose_to_mg(p['target_dose'], p['dose_unit'])
+            vol_ml = calc.draw_volume_ml(dose_mg, conc_mg_ml)
+            units = calc.syringe_units(vol_ml)
+            freq_suffix = f" ({p['frequency']})" if p['frequency'] else ""
+
+            f.write(f"• Vial Size:           {p['vial_mg']:.1f} mg\n")
+            f.write(f"• BAC Water Added:     {p['water_ml']:.1f} mL\n")
+            f.write(f"• Solution Strength:   {conc_mg_ml:.2f} mg/mL ({conc_mcg_ml:,.0f} mcg/mL)\n")
+            f.write(f"• Prescribed Dose:     {p['target_dose']} {p['dose_unit']}{freq_suffix}\n")
+            f.write(f"• U-100 Syringe Draw:  {units:.1f} Units ({vol_ml:.3f} mL)\n")
+            f.write(f"• Clinical Notes:      {p['notes'] or '-'}\n")
+
+            if p['schedule']:
+                f.write("\n  Titration Schedule:\n")
+                phase_width = max(20, max((len(phase) for phase, _, _ in p['schedule']), default=20))
+                header = f"  {'Phase':<{phase_width}} | {'Dose':<10} | {'Syringe Draw':<15}"
+                f.write(header + "\n")
+                f.write("  " + "-" * (len(header) - 2) + "\n")
+                for phase, d_val, u_unit in p['schedule']:
+                    d_mg = calc.dose_to_mg(d_val, u_unit)
+                    v_ml = calc.draw_volume_ml(d_mg, conc_mg_ml)
+                    u_draw = calc.syringe_units(v_ml)
+                    d_str = f"{d_val:.0f} mcg" if u_unit == 'mcg' else f"{d_val:.2f} mg"
+                    f.write(f"  {phase:<{phase_width}} | {d_str:<10} | {u_draw:.1f} Units\n")
+
+            if p['sources']:
+                f.write("\n  Scientific Citations & Literature:\n")
+                for s in p['sources']:
+                    f.write(f"  - {s.get('title') or '-'} (PMID: {s.get('pmid') or '-'})\n")
+                    f.write(f"    URL: {s.get('url') or '-'}\n")
+
+            f.write("\n" + "=" * 72 + "\n\n")
+
+    if dose_log:
+        f.write("RECENT DOSE LOG (Last 10 Entries)\n")
+        f.write("-" * 72 + "\n")
+        for entry in dose_log:
+            notes_suffix = f" — {entry['notes']}" if entry['notes'] else ""
+            f.write(f"  {entry['taken_at']}  {entry['peptide_name']}: {entry['dose_amount']} {entry['dose_unit']}{notes_suffix}\n")
+        f.write("\n" + "=" * 72 + "\n")
+
+    return _write_new_file(
+        dest_dir, f"patient_{calc.safe_filename_part(profile_name)}_peptides_summary", ".txt", f.getvalue()
+    )
+
+
 def export_dose_log_csv(profile_id, dest_dir=None):
-    """Export a profile's full dose log to a CSV file in dest_dir (default:
-    cwd). Returns the filename, or None if the profile doesn't exist."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM profiles WHERE id = ?", (profile_id,))
-    prof = cursor.fetchone()
-    conn.close()
+    """Export a profile's full dose log to a UTF-8 CSV file in dest_dir
+    (default: cwd, created if missing). Returns the filename, or None if the
+    profile doesn't exist. Never overwrites an existing file (a numeric suffix
+    is added). Raises OSError if the file can't be written."""
+    with _db() as conn:
+        prof = conn.execute("SELECT name FROM profiles WHERE id = ?", (profile_id,)).fetchone()
     if not prof:
         return None
     profile_name = prof["name"]
 
     dose_log = get_dose_log(profile_id)
 
-    filename = f"dose_log_{calc.safe_filename_part(profile_name)}.csv"
-    filepath = os.path.join(dest_dir or os.getcwd(), filename)
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf)
+    writer.writerow(["ID", "Peptide", "Dose Amount", "Dose Unit", "Taken At", "Notes"])
+    for entry in dose_log:
+        writer.writerow([
+            entry["id"],
+            entry["peptide_name"],
+            entry["dose_amount"],
+            entry["dose_unit"],
+            entry["taken_at"],
+            entry["notes"] or "",
+        ])
 
-    with open(filepath, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["ID", "Peptide", "Dose Amount", "Dose Unit", "Taken At", "Notes"])
-        for entry in dose_log:
-            writer.writerow([
-                entry["id"],
-                entry["peptide_name"],
-                entry["dose_amount"],
-                entry["dose_unit"],
-                entry["taken_at"],
-                entry["notes"] or "",
-            ])
-
-    return filename
+    return _write_new_file(
+        dest_dir, f"dose_log_{calc.safe_filename_part(profile_name)}", ".csv", buf.getvalue(), newline=""
+    )
 
 
 # Tracked Literature Functions
@@ -1602,8 +1708,6 @@ def save_tracked_article(
     notes: str = "",
     peptide_name: str = "",
 ) -> dict:
-    conn = get_connection()
-    cursor = conn.cursor()
     if isinstance(authors, list):
         authors_json = json.dumps(authors)
     elif isinstance(authors, str):
@@ -1615,24 +1719,24 @@ def save_tracked_article(
     if not url:
         url = f"https://pubmed.ncbi.nlm.nih.gov/{clean_pmid}/"
 
-    cursor.execute("""
-    INSERT INTO tracked_literature (pmid, title, authors_json, abstract, journal, pub_date, url, notes, peptide_name)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(pmid) DO UPDATE SET
-        title = excluded.title,
-        authors_json = excluded.authors_json,
-        abstract = excluded.abstract,
-        journal = excluded.journal,
-        pub_date = excluded.pub_date,
-        url = excluded.url,
-        notes = COALESCE(excluded.notes, tracked_literature.notes),
-        peptide_name = COALESCE(NULLIF(excluded.peptide_name, ''), tracked_literature.peptide_name)
-    """, (clean_pmid, title, authors_json, abstract, journal, pub_date, url, notes, peptide_name))
-    conn.commit()
+    with _db() as conn:
+        # Re-tracking with empty notes/peptide_name must not wipe what's stored.
+        conn.execute("""
+        INSERT INTO tracked_literature (pmid, title, authors_json, abstract, journal, pub_date, url, notes, peptide_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(pmid) DO UPDATE SET
+            title = excluded.title,
+            authors_json = excluded.authors_json,
+            abstract = excluded.abstract,
+            journal = excluded.journal,
+            pub_date = excluded.pub_date,
+            url = excluded.url,
+            notes = COALESCE(NULLIF(excluded.notes, ''), tracked_literature.notes),
+            peptide_name = COALESCE(NULLIF(excluded.peptide_name, ''), tracked_literature.peptide_name)
+        """, (clean_pmid, title, authors_json, abstract, journal, pub_date, url, notes, peptide_name))
+        conn.commit()
 
-    cursor.execute("SELECT * FROM tracked_literature WHERE pmid = ?", (clean_pmid,))
-    row = cursor.fetchone()
-    conn.close()
+        row = conn.execute("SELECT * FROM tracked_literature WHERE pmid = ?", (clean_pmid,)).fetchone()
     if row:
         d = dict(row)
         d["authors"] = json.loads(d["authors_json"]) if d["authors_json"] else []
@@ -1641,17 +1745,14 @@ def save_tracked_article(
 
 
 def get_tracked_literature(peptide_name: str | None = None) -> list[dict]:
-    conn = get_connection()
-    cursor = conn.cursor()
-    if peptide_name:
-        cursor.execute(
-            "SELECT * FROM tracked_literature WHERE peptide_name = ? ORDER BY id DESC",
-            (peptide_name,)
-        )
-    else:
-        cursor.execute("SELECT * FROM tracked_literature ORDER BY id DESC")
-    rows = cursor.fetchall()
-    conn.close()
+    with _db() as conn:
+        if peptide_name:
+            rows = conn.execute(
+                "SELECT * FROM tracked_literature WHERE peptide_name = ? ORDER BY id DESC",
+                (peptide_name,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM tracked_literature ORDER BY id DESC").fetchall()
     result = []
     for row in rows:
         d = dict(row)
@@ -1661,12 +1762,9 @@ def get_tracked_literature(peptide_name: str | None = None) -> list[dict]:
 
 
 def get_tracked_article_by_pmid(pmid: str | int) -> dict | None:
-    conn = get_connection()
-    cursor = conn.cursor()
     clean_pmid = str(pmid).strip()
-    cursor.execute("SELECT * FROM tracked_literature WHERE pmid = ?", (clean_pmid,))
-    row = cursor.fetchone()
-    conn.close()
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM tracked_literature WHERE pmid = ?", (clean_pmid,)).fetchone()
     if row:
         d = dict(row)
         d["authors"] = json.loads(d["authors_json"]) if d["authors_json"] else []
@@ -1675,19 +1773,15 @@ def get_tracked_article_by_pmid(pmid: str | int) -> dict | None:
 
 
 def delete_tracked_article(article_id: int) -> None:
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM tracked_literature WHERE id = ?", (article_id,))
-    conn.commit()
-    conn.close()
+    with _db() as conn:
+        conn.execute("DELETE FROM tracked_literature WHERE id = ?", (article_id,))
+        conn.commit()
 
 
 def clear_tracked_literature() -> None:
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM tracked_literature")
-    conn.commit()
-    conn.close()
+    with _db() as conn:
+        conn.execute("DELETE FROM tracked_literature")
+        conn.commit()
 
 
 if __name__ == "__main__":
