@@ -1,8 +1,11 @@
 """U-100 syringe gauge — the one part of this app that benefits from being
 a real drawing instead of a terminal-art string (replaces the TUI's ASCII
-make_syringe_display). Ticks mark 0/25/50/75/100 units; the barrel fills
-to the current draw and turns red past 100U, mirroring
+make_syringe_display). Ticks mark 0/25/50/75/100% of the syringe's
+capacity (30/50/100 U for the 0.3/0.5/1.0 mL U-100 syringes); the barrel
+fills to the current draw and turns red past capacity, mirroring
 calc.syringe_draw_status's overflow warning."""
+
+import math
 
 import toga
 from toga.style import Pack
@@ -28,8 +31,31 @@ class SyringeGauge(toga.Box):
         self._draw()
 
     def update(self, units: float):
-        self._units = max(0.0, units)
+        self._units = units if units is not None and math.isfinite(units) and units > 0 else 0.0
         self._draw()
+
+    def set_capacity(self, capacity: float):
+        """Change the syringe size (in units) at runtime and redraw."""
+        if capacity is not None and math.isfinite(capacity) and capacity > 0:
+            if float(capacity) == self.max_capacity:
+                return
+            self.max_capacity = float(capacity)
+        self._draw()
+
+    @property
+    def over_capacity(self) -> bool:
+        return self.max_capacity > 0 and self._units > self.max_capacity
+
+    @property
+    def fraction(self) -> float:
+        """Filled share of the barrel, always within 0.0..1.0."""
+        if not self.max_capacity or self.max_capacity <= 0 or self._units <= 0:
+            return 0.0
+        return min(self._units / self.max_capacity, 1.0)
+
+    def tick_marks(self) -> list[float]:
+        """Graduation values: 0/25/50/75/100% of capacity."""
+        return [self.max_capacity * step / 4.0 for step in range(5)]
 
     def _draw(self):
         c = self.canvas
@@ -44,8 +70,8 @@ class SyringeGauge(toga.Box):
         barrel_top, barrel_bottom = height * 0.3, height * 0.7
         barrel_w, barrel_h = barrel_right - barrel_left, barrel_bottom - barrel_top
 
-        over = self._units > self.max_capacity
-        fraction = min(self._units / self.max_capacity, 1.0) if self.max_capacity else 0.0
+        over = self.over_capacity
+        fraction = self.fraction
         fill_color = OVER_COLOR if over else OK_COLOR
 
         # needle tip, barrel outline
@@ -57,19 +83,20 @@ class SyringeGauge(toga.Box):
         with c.stroke(color=BARREL_COLOR, line_width=2):
             c.rect(barrel_left, barrel_top, barrel_w, barrel_h)
 
-        # fill level (capped visually at 100U even when the real draw overflows)
+        # fill level (capped visually at capacity even when the real draw overflows)
         if fraction > 0:
             with c.fill(color=fill_color):
                 c.rect(barrel_left, barrel_top, barrel_w * fraction, barrel_h)
 
-        # graduation ticks every 25U
+        # graduation ticks at each quarter of capacity
         tick_font = toga.Font(family="sans-serif", size=9)
-        for mark in (0, 25, 50, 75, 100):
-            x = barrel_left + barrel_w * (mark / 100.0)
+        for i, mark in enumerate(self.tick_marks()):
+            x = barrel_left + barrel_w * (i / 4.0)
+            label = f"{mark:g}"
             with c.stroke(color=TICK_COLOR, line_width=1):
                 c.move_to(x, barrel_top)
                 c.line_to(x, barrel_top - 6)
             with c.fill(color=TICK_COLOR):
-                c.fill_text(str(mark), x - 6, barrel_bottom + 14, font=tick_font)
+                c.fill_text(label, x - 3 * len(label), barrel_bottom + 14, font=tick_font)
 
         c.redraw()
