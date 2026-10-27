@@ -6,6 +6,7 @@ for PubMed IDs (PMIDs) via the NCBI Entrez E-utilities XML API (`efetch.fcgi`).
 """
 
 import asyncio
+import http.client
 import re
 import time
 import urllib.error
@@ -14,9 +15,14 @@ import urllib.request
 import xml.etree.ElementTree as ET
 
 NCBI_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-DEFAULT_USER_AGENT = "PeptideLiteratureTracker/1.0 (mailto:literature-tracker@example.com)"
-DEFAULT_TOOL = "PeptideLiteratureTracker"
-DEFAULT_EMAIL = "literature-tracker@example.com"
+DEFAULT_TOOL = "peptide-dosage-toga"
+DEFAULT_USER_AGENT = f"{DEFAULT_TOOL}/1.0 (+https://github.com/alinuxfan/peptide-dosage-app)"
+
+# Keep waits short since the UI has no cancel: the timeout applies per socket operation,
+# so the typical worst case is about 2 x 10s plus one capped backoff.
+DEFAULT_RETRIES = 2  # maximum attempts
+DEFAULT_TIMEOUT = 10.0  # seconds per attempt
+MAX_BACKOFF_SECONDS = 3.0
 
 
 def validate_pmid(pmid: str | int) -> str:
@@ -148,13 +154,32 @@ def parse_pubmed_xml(xml_content: bytes | str, pmid: str) -> dict:
     }
 
 
+def _backoff_delay(attempt: int, retry_after: str | None = None) -> float:
+    """Seconds to wait after failed attempt number `attempt` (0-based), capped.
+
+    Honors a numeric Retry-After header when present, but never waits past the cap.
+    """
+    delay = 1.0 * (attempt + 1)
+    if retry_after:
+        try:
+            delay = max(delay, float(retry_after))
+        except ValueError:
+            pass
+    return min(delay, MAX_BACKOFF_SECONDS)
+
+
 def fetch_pubmed_article_sync(
     pmid: str | int,
-    retries: int = 3,
-    timeout: float = 12.0,
+    retries: int = DEFAULT_RETRIES,
+    timeout: float = DEFAULT_TIMEOUT,
     api_key: str | None = None,
 ) -> dict:
-    """Fetch article data from NCBI E-utilities synchronously with retry backoff."""
+    """Fetch article data from NCBI E-utilities synchronously with retry backoff.
+
+    `retries` is the maximum number of attempts (minimum 1). Raises ValueError for an
+    invalid PMID or an article that is not found / cannot be parsed, and RuntimeError
+    for any network or server failure (after retries are exhausted).
+    """
     clean_pmid = validate_pmid(pmid)
 
     params = {
@@ -162,7 +187,6 @@ def fetch_pubmed_article_sync(
         "id": clean_pmid,
         "retmode": "xml",
         "tool": DEFAULT_TOOL,
-        "email": DEFAULT_EMAIL,
     }
     if api_key:
         params["api_key"] = api_key
@@ -175,40 +199,47 @@ def fetch_pubmed_article_sync(
     }
 
     req = urllib.request.Request(url, headers=headers)
-    last_error: Exception | None = None
+    attempts = max(1, int(retries))
 
-    for attempt in range(retries):
+    for attempt in range(attempts):
+        is_last = attempt == attempts - 1
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 xml_data = resp.read()
-            return parse_pubmed_xml(xml_data, clean_pmid)
         except urllib.error.HTTPError as http_err:
-            last_error = http_err
-            # 429 Too Many Requests -> backoff and retry
-            if http_err.code == 429 and attempt < retries - 1:
-                time.sleep(1.0 * (attempt + 1))
+            # 429 (rate limited) and 5xx (server trouble) are worth retrying.
+            retryable = http_err.code == 429 or http_err.code >= 500
+            http_err.close()
+            if retryable and not is_last:
+                time.sleep(_backoff_delay(attempt, http_err.headers.get("Retry-After")))
                 continue
-            # 5xx Server Error -> backoff and retry
-            if http_err.code >= 500 and attempt < retries - 1:
-                time.sleep(1.0 * (attempt + 1))
+            if http_err.code == 429:
+                msg = "NCBI is rate-limiting requests right now. Please try again in a moment."
+            elif http_err.code >= 500:
+                msg = f"The NCBI PubMed service is having problems (HTTP {http_err.code}). Please try again later."
+            else:
+                msg = f"NCBI rejected the request (HTTP {http_err.code}: {http_err.reason})."
+            raise RuntimeError(msg) from http_err
+        except (OSError, http.client.HTTPException) as net_err:
+            # Covers URLError, timeouts, connection resets, ssl.SSLError (all OSError
+            # subclasses) and http.client.IncompleteRead / RemoteDisconnected.
+            if not is_last:
+                time.sleep(_backoff_delay(attempt))
                 continue
-            raise RuntimeError(f"NCBI E-utilities HTTP {http_err.code}: {http_err.reason}") from http_err
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as net_err:
-            last_error = net_err
-            if attempt < retries - 1:
-                time.sleep(1.0 * (attempt + 1))
-                continue
-            raise RuntimeError(f"Network connection error contacting NCBI: {net_err}") from net_err
+            raise RuntimeError(
+                "Could not reach NCBI PubMed. Check your internet connection and try again "
+                f"({type(net_err).__name__}: {net_err})."
+            ) from net_err
+        return parse_pubmed_xml(xml_data, clean_pmid)
 
-    if last_error:
-        raise RuntimeError(f"Failed to fetch PMID {clean_pmid} after {retries} attempts: {last_error}")
+    # Unreachable: every iteration either returns, raises, or continues to a later one.
     raise RuntimeError(f"Failed to fetch PMID {clean_pmid}.")
 
 
 async def fetch_pubmed_article(
     pmid: str | int,
-    retries: int = 3,
-    timeout: float = 12.0,
+    retries: int = DEFAULT_RETRIES,
+    timeout: float = DEFAULT_TIMEOUT,
     api_key: str | None = None,
 ) -> dict:
     """Async wrapper that runs the NCBI E-utilities fetch in a background thread."""
