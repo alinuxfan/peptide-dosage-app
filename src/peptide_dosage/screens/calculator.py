@@ -110,6 +110,7 @@ class CalculatorScreen(Screen):
                 self.error_label,
                 self.card,
                 toga.Button("Split vial (what-if)", on_press=self._open_vial_split, style=Pack(margin=(8, 12))),
+                toga.Button("Save as protocol", on_press=self._save_as_protocol, style=Pack(margin=(0, 12, 8, 12))),
             ],
         )
         self._loading = False
@@ -208,6 +209,18 @@ class CalculatorScreen(Screen):
             )
         else:
             self.duration_label.text = ""
+
+    def _save_as_protocol(self, widget):
+        from ..dialogs.profile_picker import start_protocol_form
+        preset = self.preset.value
+        prefill = {
+            "vial_mg": num(self.vial_mg.value), "water_ml": num(self.water_ml.value),
+            "target_dose": num(self.dose.value), "dose_unit": self.unit.value,
+        }
+        if preset in self._presets:
+            prefill["peptide_name"] = preset
+            prefill["frequency"] = self._presets[preset].get("frequency") or ""
+        start_protocol_form(self.nav, prefill)
 
     def _open_vial_split(self, widget):
         from ..dialogs.vial_split import VialSplitScreen

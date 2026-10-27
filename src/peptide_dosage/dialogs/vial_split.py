@@ -25,7 +25,7 @@ class VialSplitScreen(Screen):
 
     def build(self) -> toga.Box:
         self.splits = toga.NumberInput(value=2, min=1, step=1, on_change=self._recalculate)
-        self.result = toga.MultilineTextInput(readonly=True, style=Pack(flex=1))
+        self.result = toga.MultilineTextInput(readonly=True, style=Pack(flex=1, height=160))
 
         box = toga.Box(
             style=Pack(direction=COLUMN, margin=12),

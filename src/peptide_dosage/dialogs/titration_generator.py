@@ -23,7 +23,7 @@ class TitrationGeneratorScreen(Screen):
         self.target_dose = toga.NumberInput(value=p["target_dose"], step=1)
         self.step_increment = toga.NumberInput(value=1, min=0, step=0.5)
         self.weeks_per_step = toga.NumberInput(value=2, min=0.5, step=0.5)
-        self.preview = toga.MultilineTextInput(readonly=True, style=Pack(flex=1))
+        self.preview = toga.MultilineTextInput(readonly=True, style=Pack(flex=1, height=160))
         self.error = toga.Label("")
 
         for widget in (self.start_dose, self.target_dose, self.step_increment, self.weeks_per_step):

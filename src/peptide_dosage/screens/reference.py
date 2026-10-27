@@ -22,10 +22,14 @@ class ReferenceScreen(Screen):
         super().__init__(nav)
         # Optional hook (peptide_name) -> None, forwarded to the detail screen
         # so the app can offer "Add to profile" from the reference.
-        self.on_add_to_profile = on_add_to_profile
+        self.on_add_to_profile = on_add_to_profile or self._add_to_profile
         self._peptides = []
         self._query = ""  # survives nav pop(), which rebuilds the widgets
         self._load_error = ""
+
+    def _add_to_profile(self, peptide_name):
+        from ..dialogs.profile_picker import start_protocol_form
+        start_protocol_form(self.nav, {"peptide_name": peptide_name})
 
     def build(self) -> toga.Box:
         self.list_box = toga.Box(style=Pack(direction=COLUMN))
