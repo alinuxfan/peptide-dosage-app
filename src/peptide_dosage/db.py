@@ -1460,6 +1460,25 @@ def _current_phase_dose_mg(schedule, weeks_elapsed, default_dose_mg):
     return chosen if chosen > 0 else default_dose_mg
 
 
+def current_protocol_dose(protocol, now=None):
+    """(amount, unit) to take today for a protocol dict from
+    get_user_protocol_by_id: the dose of the active titration phase (phases
+    run from the protocol's created_at, as in get_protocol_adherence), or the
+    plain target dose when there is no usable schedule. The amount is in the
+    protocol's own dose unit."""
+    target, unit = protocol["target_dose"], protocol["dose_unit"]
+    created_dt = _parse_ts(protocol.get("created_at"))
+    if not protocol.get("schedule") or created_dt is None:
+        return target, unit
+    now = now or _utc_now()
+    weeks = max(0.0, (now - created_dt).total_seconds() / 86400.0) / 7.0
+    target_mg = calc.dose_to_mg(target, unit)
+    dose_mg = _current_phase_dose_mg(protocol["schedule"], weeks, target_mg)
+    if dose_mg == target_mg:
+        return target, unit
+    return round(calc.convert_dose(dose_mg, "mg", unit), 6), unit
+
+
 def get_protocol_adherence(profile_id):
     """Compute a best-effort adherence percentage per protocol for a profile.
 

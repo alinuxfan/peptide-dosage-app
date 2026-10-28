@@ -29,7 +29,7 @@ class LogDoseScreen(Screen):
         # Shown in local time; remembered so an untouched field keeps the
         # stored value (and its seconds) instead of being re-parsed.
         self._initial_taken_at = utc_to_local_input(e["taken_at"]) if e else ""
-        self.amount = toga.NumberInput(value=e["dose_amount"] if e else self.protocol["target_dose"], step=1)
+        self.amount = toga.NumberInput(value=e["dose_amount"] if e else db.current_protocol_dose(self.protocol)[0], step=1)
         self.unit = toga.Selection(items=UNITS, value=e["dose_unit"] if e else self.protocol["dose_unit"])
         self.taken_at = toga.TextInput(
             value=self._initial_taken_at,

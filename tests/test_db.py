@@ -685,3 +685,38 @@ def test_delete_profile_unknown_id_with_multiple_profiles(fresh_db):
     fresh_db.add_profile("Other")
     assert fresh_db.delete_profile(99999) is True  # nothing to delete, but not refused
     assert len(fresh_db.get_profiles()) == 2
+
+
+def test_current_protocol_dose_follows_titration_phase(fresh_db):
+    pid = fresh_db.get_profiles()[0]["id"]
+    schedule = [
+        ("Week 1-2", 250.0, "mcg"),
+        ("Week 3-4", 500.0, "mcg"),
+        ("Week 5+ (Maintenance)", 1000.0, "mcg"),
+    ]
+    fresh_db.add_or_update_user_protocol(pid, "BPC-157", 5.0, 2.0, 1000.0, "mcg", "daily", "n", schedule, [])
+    protocol = fresh_db.get_user_protocols(pid)[0]
+    created = datetime.strptime(protocol["created_at"], "%Y-%m-%d %H:%M:%S")
+
+    def dose_after(days):
+        return fresh_db.current_protocol_dose(protocol, now=created + timedelta(days=days))
+
+    assert dose_after(0) == (250.0, "mcg")
+    assert dose_after(15) == (500.0, "mcg")
+    assert dose_after(40) == (1000.0, "mcg")
+
+
+def test_current_protocol_dose_converts_to_protocol_unit(fresh_db):
+    pid = fresh_db.get_profiles()[0]["id"]
+    fresh_db.add_or_update_user_protocol(
+        pid, "Tesamorelin", 5.0, 2.0, 2.0, "mg", "daily", "n", [("Week 1+", 500.0, "mcg")], []
+    )
+    protocol = fresh_db.get_user_protocols(pid)[0]
+    assert fresh_db.current_protocol_dose(protocol) == (0.5, "mg")
+
+
+def test_current_protocol_dose_without_schedule_is_target(fresh_db):
+    pid = fresh_db.get_profiles()[0]["id"]
+    fresh_db.add_or_update_user_protocol(pid, "BPC-157", 5.0, 2.0, 250.0, "mcg", "daily", "n", [], [])
+    protocol = fresh_db.get_user_protocols(pid)[0]
+    assert fresh_db.current_protocol_dose(protocol) == (250.0, "mcg")

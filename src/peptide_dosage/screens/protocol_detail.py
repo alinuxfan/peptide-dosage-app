@@ -91,6 +91,9 @@ class ProtocolDetailScreen(Screen):
 
         # --- Summary ---
         summary = [f"Dose: {_fmt_dose(protocol['target_dose'])} {protocol['dose_unit']} ({protocol['frequency']})"]
+        today_dose, today_unit = db.current_protocol_dose(protocol)
+        if (today_dose, today_unit) != (protocol["target_dose"], protocol["dose_unit"]):
+            summary.append(f"Current titration dose: {_fmt_dose(today_dose)} {today_unit}")
         if a:
             summary.append(f"Next dose: {calc.format_due_label(a['next_due_at'], now)}")
             summary.append(f"Adherence: {a['adherence_label']}")
@@ -152,11 +155,13 @@ class ProtocolDetailScreen(Screen):
             self.dose_log_box.add(toga.Label("Tap a dose to edit or delete it.", style=MUTED_STYLE))
 
     def _log_dose_now(self, widget):
-        """One-tap log of the protocol's dose, timestamped now."""
+        """One-tap log of today's dose (the active titration phase's, else the
+        target dose), timestamped now."""
         p = self.protocol
-        db.log_dose(p["profile_id"], p["id"], p["peptide_name"], p["target_dose"], p["dose_unit"])
+        amount, unit = db.current_protocol_dose(p)
+        db.log_dose(p["profile_id"], p["id"], p["peptide_name"], amount, unit)
         self._refresh()
-        self.status.text = f"Logged {_fmt_dose(p['target_dose'])} {p['dose_unit']} of {p['peptide_name']}."
+        self.status.text = f"Logged {_fmt_dose(amount)} {unit} of {p['peptide_name']}."
 
     def _make_edit_entry(self, entry_id):
         def handler(widget):
