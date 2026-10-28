@@ -6,12 +6,16 @@ Bug fixes
 - Dosing math, database, and PubMed (NCBI) handling fixes.
 - Protocol creation fixes.
 - Scrolling fixes on long screens.
+- "Log dose now" and the log-dose form use the current titration phase's dose instead of always the target dose.
+- The vial-split screen now takes the calculator's syringe size into account (warns when a dose overflows it).
 
 Features
 - Dose log editing.
 - Calculator presets.
 - Literature tracker improvements.
 - Profile management.
+- Android: the system Back gesture/button now steps back through screens (Android 13+; best-effort).
+- Android: exports open the share sheet, so the file can be saved to Drive, emailed, etc.
 - Phone-shaped default window size on desktop.
 
 Packaging and CI

@@ -17,8 +17,12 @@ MAX_SPLITS = 50
 
 
 class VialSplitScreen(Screen):
-    def __init__(self, nav, vial_mg: float, water_ml: float, dose_mg: float | None = None):
+    def __init__(
+        self, nav, vial_mg: float, water_ml: float, dose_mg: float | None = None,
+        syringe_capacity: float = 100.0,
+    ):
         super().__init__(nav)
+        self.syringe_capacity = syringe_capacity  # units; 30/50/100 U-100 syringes
         self.vial_mg = vial_mg
         self.water_ml = water_ml
         self.dose_mg = dose_mg  # optional: enables per-aliquot draw/dose lines
@@ -70,5 +74,7 @@ class VialSplitScreen(Screen):
             dose_txt = f"{dose_mcg / 1000:.4g} mg" if dose_mcg >= 1000 else f"{dose_mcg:.4g} mcg"
             lines.append(f"For a {dose_txt} dose:")
             lines.append(f"  Draw {units:.1f} units ({draw_ml:.3f} mL) per dose")
+            _, status = calc.syringe_draw_status(units, self.syringe_capacity)
+            lines.append(f"  {status}")
             lines.append(f"  {doses:.1f} doses per aliquot ({doses * splits:.1f} total)")
         self.result.value = note + "\n".join(lines)

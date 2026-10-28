@@ -12,6 +12,7 @@ from toga.style import Pack
 from toga.style.pack import COLUMN
 
 from .. import db
+from ..android_support import share_text
 from ..nav import Screen
 from ..dialogs.add_profile import AddProfileScreen
 
@@ -203,5 +204,19 @@ class MoreScreen(Screen):
         saved = os.path.join(str(dest_dir), str(filename))
         if self._used_fallback:
             self.export_status.text = f"Saved to the app's exports folder: {saved}"
+            self._offer_share(saved)
         else:
             self.export_status.text = f"Saved to {saved}"
+
+    def _offer_share(self, path):
+        """Android keeps exports in an app-private folder no file manager can
+        open, so also hand the contents to the system share sheet."""
+        if not _is_android():
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            return
+        if share_text(self.nav.window.app, text, subject=os.path.basename(path)):
+            self.export_status.text += " Choose where to send it from the share sheet."

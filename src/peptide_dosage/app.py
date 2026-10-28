@@ -5,6 +5,7 @@ from toga.style import Pack
 from toga.style.pack import COLUMN
 
 from . import db
+from .android_support import BackHandler
 from .nav import NavigationController, TabBar
 from .screens.calculator import CalculatorScreen
 from .screens.patients import PatientsScreen
@@ -33,10 +34,28 @@ class PeptideDosageApp(toga.App):
         }
         self.destinations = destinations
         self.tab_bar = TabBar(root, destinations)
+
+        # Android's system Back pops the active tab's stack (a no-op elsewhere).
+        self.back_handler = BackHandler(
+            self, can_go_back=self._can_go_back, go_back=self._go_back
+        )
+        for controller in destinations.values():
+            controller.on_stack_change = self.back_handler.sync
+        self.tab_bar.on_switch = self.back_handler.sync
+
         self.tab_bar.switch_to("Calculator")
 
         self.main_window.content = root
         self.main_window.show()
+
+    def _can_go_back(self) -> bool:
+        controller = self.tab_bar.active_controller
+        return controller is not None and controller.can_pop
+
+    def _go_back(self):
+        controller = self.tab_bar.active_controller
+        if controller is not None:
+            controller.pop()
 
 
 def main():

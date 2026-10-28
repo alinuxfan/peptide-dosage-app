@@ -227,4 +227,7 @@ class CalculatorScreen(Screen):
         vial_mg, water_ml = num(self.vial_mg.value), num(self.water_ml.value)
         dose = num(self.dose.value)
         dose_mg = calc.dose_to_mg(dose, self.unit.value) if dose > 0 else None
-        self.nav.push(lambda nav: VialSplitScreen(nav, vial_mg=vial_mg, water_ml=water_ml, dose_mg=dose_mg))
+        capacity = SYRINGES.get(self.syringe_size.value, 100.0)
+        self.nav.push(lambda nav: VialSplitScreen(
+            nav, vial_mg=vial_mg, water_ml=water_ml, dose_mg=dose_mg, syringe_capacity=capacity,
+        ))

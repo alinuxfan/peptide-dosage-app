@@ -23,7 +23,9 @@ screen itself clears and refills its widgets) and then calls
 therefore do their data refreshing in ``on_shown``, not only in ``build``.
 
 Android hardware Back: Toga 0.5 (toga-android) exposes no back-press hook
-(no ``on_back``/``onBackPressed`` on App or Window), so nothing is wired here.
+(no ``on_back``/``onBackPressed`` on App or Window). ``on_stack_change`` /
+``TabBar.on_switch`` tell the app when the active stack's depth may have
+changed so it can register a platform back-callback (see android_support.py).
 """
 
 import toga
@@ -57,6 +59,7 @@ class NavigationController:
         self.window = window  # set by the App, so screens can show dialogs
         self._stack = [root_factory(self)]
         self._views = {}  # screen -> ScrollContainer, for screens on the stack
+        self.on_stack_change = None  # optional callback, after every push/pop
         self.content = toga.Box(style=Pack(direction=COLUMN, flex=1))
         self._render()
 
@@ -71,12 +74,25 @@ class NavigationController:
                 self._stack.remove(screen)
             self._views.pop(screen, None)
             raise
+        self._stack_changed()
 
     def pop(self):
-        if len(self._stack) > 1:
-            self._views.pop(self._stack.pop(), None)
-            self._render()
-            self.notify_shown()
+        """Go back one screen. Returns False (doing nothing) at the root."""
+        if len(self._stack) <= 1:
+            return False
+        self._views.pop(self._stack.pop(), None)
+        self._render()
+        self.notify_shown()
+        self._stack_changed()
+        return True
+
+    @property
+    def can_pop(self) -> bool:
+        return len(self._stack) > 1
+
+    def _stack_changed(self):
+        if self.on_stack_change:
+            self.on_stack_change()
 
     def notify_shown(self):
         """Tell the visible screen it (re)appeared; called after rendering."""
@@ -108,12 +124,17 @@ class TabBar:
         # destinations: {label: NavigationController}
         self.root_content = root_content
         self.destinations = destinations
+        self.on_switch = None  # optional callback, after the active tab changes
         self.buttons = {
             label: toga.Button(label, on_press=self._make_switch(label), style=INACTIVE_STYLE.copy())
             for label in destinations
         }
         self.bar = toga.Box(style=Pack(direction=ROW, background_color=BAR_BG), children=list(self.buttons.values()))
         self._active = None
+
+    @property
+    def active_controller(self):
+        return self.destinations.get(self._active)
 
     def _make_switch(self, label):
         def handler(widget):
@@ -130,3 +151,5 @@ class TabBar:
         self.root_content.add(self.destinations[label].content)
         self.root_content.add(self.bar)
         self.destinations[label].notify_shown()
+        if self.on_switch:
+            self.on_switch()
