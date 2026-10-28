@@ -73,8 +73,17 @@ jobs:
       # exact profile name Briefcase looks for (briefcase-macOS-<team-id>,
       # see SigningIdentity.profile in briefcase's own source), and discover
       # the signing identity string rather than hardcoding it.
-      - name: Import macOS signing certificate
+      # The Apple secrets are optional: without them the macOS app is built
+      # ad-hoc signed (not notarized), so a missing certificate no longer
+      # blocks the whole release.
+      - name: Check for macOS signing secrets
         if: matrix.platform == 'macOS'
+        env:
+          HAS_CERT: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' }}
+        run: echo "MACOS_SIGN=$HAS_CERT" >> "$GITHUB_ENV"
+
+      - name: Import macOS signing certificate
+        if: matrix.platform == 'macOS' && env.MACOS_SIGN == 'true'
         env:
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -112,8 +121,12 @@ jobs:
         run: briefcase package ${{ matrix.platform }} ${{ matrix.format }} --no-input ${{ matrix.package-args }}
 
       - name: Package (macOS, signed + notarized)
-        if: matrix.platform == 'macOS'
+        if: matrix.platform == 'macOS' && env.MACOS_SIGN == 'true'
         run: briefcase package macOS app --no-input -i "$MACOS_IDENTITY"
+
+      - name: Package (macOS, ad-hoc signed)
+        if: matrix.platform == 'macOS' && env.MACOS_SIGN != 'true'
+        run: briefcase package macOS app --no-input --adhoc-sign
 
       # `briefcase package android gradle -p apk` produces an unsigned release
       # APK -- Briefcase has no Android signing support of its own (--adhoc-sign
