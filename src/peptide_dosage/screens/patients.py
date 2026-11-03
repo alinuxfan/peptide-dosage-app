@@ -113,11 +113,27 @@ class PatientsScreen(Screen):
             style=CARD_STYLE,
             children=[
                 title, badges,
-                toga.Button("Details", on_press=self._make_open_detail(protocol["id"]), style=Pack(margin_top=6)),
+                toga.Box(
+                    style=Pack(direction=ROW, gap=8, margin_top=6),
+                    children=[
+                        toga.Button("Details", on_press=self._make_open_detail(protocol["id"]), style=Pack(flex=1)),
+                        toga.Button("Delete", on_press=self._make_delete_protocol(protocol), style=Pack(flex=1)),
+                    ],
+                ),
             ],
         )
 
     def _make_open_detail(self, protocol_id):
         def handler(widget):
             self.nav.push(lambda nav: ProtocolDetailScreen(nav, protocol_id, on_deleted=self._refresh_cards))
+        return handler
+
+    def _make_delete_protocol(self, protocol):
+        async def handler(widget):
+            if await self.nav.window.confirm_dialog(
+                "Delete protocol",
+                f"Delete the {protocol['peptide_name']} protocol? Dose history is kept.",
+            ):
+                db.delete_user_protocol(protocol["id"])
+                self._refresh_cards()
         return handler

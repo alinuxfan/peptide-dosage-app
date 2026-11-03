@@ -138,7 +138,11 @@ class ProtocolDetailScreen(Screen):
 
         # --- Dose log ---
         self.dose_log_box.clear()
-        entries = [e for e in db.get_dose_log(protocol["profile_id"]) if e["protocol_id"] == self.protocol_id]
+        entries = [
+            e for e in db.get_dose_log(protocol["profile_id"])
+            if e["protocol_id"] == self.protocol_id
+            or (e["protocol_id"] is None and e["peptide_name"].lower() == protocol["peptide_name"].lower())
+        ]
         if not entries:
             self.dose_log_box.add(toga.Label("No doses logged yet", style=MUTED_STYLE))
         for entry in entries[:MAX_LOG_ROWS]:
