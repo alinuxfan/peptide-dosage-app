@@ -2,6 +2,8 @@ import math
 import re
 from datetime import datetime, timedelta
 
+from . import states
+
 # Pure dosing-math and adherence-heuristic functions shared by main.py (live UI)
 # and db.py (file export), so the formula only lives in one place.
 
@@ -209,15 +211,7 @@ def next_dose_due_at(
 
 def format_due_label(next_due_at: datetime | None, now: datetime) -> str:
     """Human-readable label for a next_dose_due_at value relative to `now`."""
-    if next_due_at is None:
-        return "N/A"
-
-    delta_days = (next_due_at - now).total_seconds() / 86400.0
-    if delta_days < 0:
-        overdue_days = abs(delta_days)
-        return "Overdue (today)" if overdue_days < 1 else f"Overdue {overdue_days:.0f}d"
-
-    return "Due today" if delta_days < 1 else f"Due in {delta_days:.0f}d"
+    return states.evaluate_dose_due(next_due_at, now).label
 
 
 def format_vial_duration(doses_per_vial: float, weekly_expected: float | None, freq_text: str = "") -> str:
@@ -249,22 +243,8 @@ def syringe_draw_status(units: float, max_capacity: float = 100.0) -> tuple[str,
     e.g. ("80.0 Units", "✓ Normal draw (80.0U / 100U)")
     or ("⚠️ 160.0 Units", "⚠️ Exceeds 100U (1x 100U + 1x 60.0U)")
     """
-    if units <= 0:
-        return "0.0 Units", "—"
-    if max_capacity <= 0:
-        return f"{units:.1f} Units", "—"
-    cap = f"{max_capacity:g}U"
-    if units <= max_capacity:
-        return f"{units:.1f} Units", f"✓ Normal draw ({units:.1f}U / {cap})"
-
-    rounded = round(units, 6)  # avoid float noise just below an exact multiple
-    draws = int(rounded // max_capacity)
-    remainder = rounded % max_capacity
-    if remainder > 0.05:
-        draw_desc = f"{draws}x {cap} + 1x {remainder:.1f}U"
-    else:
-        draw_desc = f"{draws}x {cap}"
-    return f"⚠️ {units:.1f} Units", f"⚠️ Exceeds {cap} ({draw_desc})"
+    info = states.evaluate_syringe_draw(units, max_capacity)
+    return info.draw_label, info.status_label
 
 
 def generate_titration_schedule(
@@ -365,7 +345,6 @@ def split_vial_aliquots(vial_mg: float, water_ml: float, num_splits: int) -> dic
     }
 
 
-
 # Reconstituted peptide in bacteriostatic water is generally considered stable
 # for ~28 days refrigerated; past that the solution is beyond-use regardless of
 # how many doses are left in the vial.
@@ -381,18 +360,7 @@ def bud_expiry_at(reconstituted_at: datetime | None, bud_days: float = DEFAULT_B
 
 def format_bud_label(expiry_at: datetime | None, now: datetime) -> str:
     """Human-readable beyond-use-date status for a reconstituted vial."""
-    if expiry_at is None:
-        return "Not reconstituted"
-
-    delta_days = (expiry_at - now).total_seconds() / 86400.0
-    if delta_days < 0:
-        expired_days = abs(delta_days)
-        return "❌ Expired today" if expired_days < 1 else f"❌ Expired {expired_days:.0f}d ago"
-    if delta_days < 1:
-        return "⚠️ Expires today"
-    if delta_days <= 5:
-        return f"⚠️ Expires in {delta_days:.0f}d"
-    return f"✓ Fresh ({delta_days:.0f}d left)"
+    return states.evaluate_bud_state(expiry_at, now).label
 
 
 def bud_exceeded_by_duration(
@@ -421,13 +389,7 @@ def adherence_label(
     A brand-new protocol and an unparseable frequency both yield
     adherence_pct=None but mean very different things to the user.
     """
-    if adherence_pct is not None:
-        return f"{adherence_pct:.0f}%"
-    if weekly_expected is None or weekly_expected <= 0:
-        return "Freq. not recognized"
-    if days_elapsed < 1:
-        return "Too new"
-    return "N/A"
+    return states.evaluate_adherence_label(adherence_pct, weekly_expected, days_elapsed).label
 
 
 def doses_remaining(doses_per_vial: float, doses_used: int) -> float:
@@ -437,13 +399,7 @@ def doses_remaining(doses_per_vial: float, doses_used: int) -> float:
 
 def format_doses_remaining(remaining: float, total: float) -> str:
     """Inventory label for a vial, warning as it runs low."""
-    if total <= 0:
-        return "N/A"
-    if remaining <= 0:
-        return "❌ Empty - reorder"
-    if remaining <= 2:
-        return f"⚠️ {remaining:.1f} left - reorder"
-    return f"{remaining:.1f} / {total:.1f} left"
+    return states.evaluate_doses_remaining(remaining, total).label
 
 
 # dose_log timestamps are naive UTC strings (SQLite CURRENT_TIMESTAMP), so
@@ -512,20 +468,7 @@ def validate_reconstitution_inputs(
     unit: str,
 ) -> str | None:
     """Return a human-readable problem with the calculator inputs, else None."""
-    for label, value in (("Vial size", vial_mg), ("BAC water", water_ml), ("Dose", dose)):
-        if not math.isfinite(value):
-            return f"{label} must be a real number."
-        if value <= 0:
-            return "Enter positive numbers..."
-
-    if vial_mg > MAX_VIAL_MG:
-        return f"Vial size must be {MAX_VIAL_MG:,.0f} mg or less."
-    if water_ml > MAX_WATER_ML:
-        return f"BAC water must be {MAX_WATER_ML:,.0f} mL or less."
-    if dose_to_mg(dose, unit) > MAX_DOSE_MG:
-        return f"Dose must be {MAX_DOSE_MG:,.0f} mg or less."
-
-    return None
+    return states.evaluate_calc_inputs(vial_mg, water_ml, dose, unit).error_message
 
 
 def convert_dose(value: float, from_unit: str, to_unit: str) -> float:

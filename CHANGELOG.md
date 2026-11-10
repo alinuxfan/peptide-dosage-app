@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1
+
+Architecture & State Machines
+- Formalized 9 explicit domain state machines in new `states.py` module (`BudState`, `VialInventoryState`, `DoseDueState`, `AdherenceState`, `SyringeDrawState`, `CalcInputState`, `TitrationPhaseState`, `LiteratureTrackingState`, `NavStackState`).
+- Elevated UX: Harmonized visual palette tokens across screens, and added syringe capacity upgrade recommendations.
+- Elevated DX: Strong type safety and immutable dataclasses eliminate fragmented string matching and duplicated delta math.
+- Elevated AX: Fully deterministic, introspectable states and zero-GUI pure evaluators allow AI agents to test and reason about application states without string parsing.
+- 100% backward-compatibility across all dosing and adherence formulas, verified by complete test suite.
+
 ## 0.2.0
 
 Bug fixes
