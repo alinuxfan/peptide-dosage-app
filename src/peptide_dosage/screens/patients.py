@@ -13,7 +13,7 @@ import toga
 from toga.style import Pack
 from toga.style.pack import COLUMN, ROW
 
-from .. import calc, db
+from .. import calc, db, states
 from ..nav import Screen
 from .protocol_detail import ProtocolDetailScreen
 
@@ -26,11 +26,10 @@ PILL_OVERDUE = Pack(background_color="#c62828", color="#ffebee", font_size=11, m
 
 
 def _pill_style(bud_expiry_at, now):
-    if bud_expiry_at is None:
-        return PILL_WARN
-    if bud_expiry_at <= now:
+    info = states.evaluate_bud_state(bud_expiry_at, now)
+    if info.is_expired:
         return PILL_OVERDUE
-    if bud_expiry_at <= now + timedelta(days=5):
+    if info.is_warning:
         return PILL_WARN
     return PILL_OK
 
